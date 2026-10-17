@@ -1,0 +1,81 @@
+//! OnyxOS kernel, Phase 1: boot, CPU setup, memory management.
+//!
+//! Boot order matters and is deliberate:
+//! serial -> boot info -> CPU protections -> frame allocator -> GDT/IDT ->
+//! own page tables (W^X audited) -> heap -> x2APIC -> (selftest | idle).
+
+#![no_std]
+#![no_main]
+#![deny(unsafe_op_in_unsafe_fn)]
+// Several accessors exist only for the self-test build until later phases use them.
+#![cfg_attr(not(feature = "selftest"), allow(dead_code))]
+
+extern crate alloc;
+
+#[macro_use]
+mod log;
+mod arch;
+mod boot;
+mod limine;
+mod mm;
+mod panic;
+mod perf;
+#[cfg(feature = "selftest")]
+mod qemu;
+#[cfg(feature = "selftest")]
+mod selftest;
+mod serial;
+
+pub const NAME: &str = "OnyxOS";
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Initial kernel heap. Backed by contiguous physical frames via the direct map.
+const HEAP_BYTES: usize = 16 * 1024 * 1024;
+
+// Entry point. Limine enters with interrupts off on its own stack; switch to
+// our guarded boot stack before running any Rust code.
+core::arch::global_asm!(
+    r#"
+    .section .text.boot,"ax"
+    .global _start
+_start:
+    cli
+    lea rsp, [rip + __boot_stack_top]
+    xor ebp, ebp
+    call kmain
+2:
+    hlt
+    jmp 2b
+"#
+);
+
+#[unsafe(no_mangle)]
+extern "C" fn kmain() -> ! {
+    serial::init();
+    kprintln!("{NAME} {VERSION} booting");
+
+    let info = boot::collect();
+    mm::set_hhdm(info.hhdm);
+    arch::cpu::init();
+    mm::frame::init(info);
+    arch::gdt::init();
+    arch::idt::init();
+    mm::paging::init_kernel_space(info);
+    mm::heap::init(HEAP_BYTES);
+    arch::apic::init();
+
+    kprintln!(
+        "boot complete: {} MiB free of {} MiB",
+        mm::frame::free_frames() * mm::PAGE_SIZE / (1 << 20),
+        mm::frame::total_frames() * mm::PAGE_SIZE / (1 << 20)
+    );
+
+    #[cfg(feature = "selftest")]
+    selftest::run();
+
+    #[cfg(not(feature = "selftest"))]
+    {
+        kprintln!("idle (Phase 1 has no scheduler yet)");
+        arch::cpu::halt_forever()
+    }
+}

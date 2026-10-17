@@ -1,0 +1,6 @@
+[alias]
+xtask = "run --quiet --package xtask --"
+
+# The kernel is a fixed-address static image (linker.ld), not a PIE.
+[target.x86_64-unknown-none]
+rustflags = ["-C", "relocation-model=static"]

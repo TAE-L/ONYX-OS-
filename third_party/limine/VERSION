@@ -1,0 +1,4 @@
+Limine 11.4.1 binary release (branch v11.x-binary, commit 5be26a7)
+BOOTX64.EFI sha256: 333f7a69379b1f47e019be215885cdc078b9edd6e9255cbe2f706d6c5ec0ef06
+Source: https://github.com/limine-bootloader/limine
+License: BSD-2-Clause (see LICENSE)

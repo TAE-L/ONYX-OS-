@@ -1,0 +1,13 @@
+[workspace]
+resolver = "3"
+members = ["kernel", "xtask"]
+# `cargo build` at the root must not try to build the kernel for the host.
+default-members = ["xtask"]
+
+[profile.dev]
+panic = "abort"
+opt-level = 1
+
+[profile.release]
+panic = "abort"
+opt-level = 3

@@ -35,6 +35,13 @@ const REG_EOI: u32 = 0xB0;
 const REG_SVR: u32 = 0xF0;
 const REG_ICR_LOW: u32 = 0x300;
 const X2APIC_SELF_IPI: u32 = 0x83F;
+const REG_LVT_TIMER: u32 = 0x320;
+const REG_TIMER_INITIAL: u32 = 0x380;
+const REG_TIMER_CURRENT: u32 = 0x390;
+const REG_TIMER_DIVIDE: u32 = 0x3E0;
+const IA32_TSC_DEADLINE: u32 = 0x6E0;
+const LVT_MASKED: u64 = 1 << 16;
+const LVT_TSC_DEADLINE: u64 = 0b10 << 17;
 
 fn read(reg: u32) -> u64 {
     match mode() {
@@ -136,5 +143,86 @@ pub fn send_self_ipi(vector: u8) {
         Mode::X2Apic => unsafe { Msr::new(X2APIC_SELF_IPI).write(u64::from(vector)) },
         // Fixed delivery, destination shorthand "self" (bits 19:18 = 01).
         Mode::XApic { .. } => write(REG_ICR_LOW, (1 << 18) | u64::from(vector)),
+    }
+}
+
+// --- Timer ---------------------------------------------------------------------
+//
+// Preferred: TSC-deadline mode (one absolute TSC value, no calibration, no
+// rounding). Fallback: the LAPIC one-shot countdown, calibrated against the TSC.
+// Either way the timer is one-shot: nothing fires unless the scheduler asked.
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TimerKind {
+    TscDeadline,
+    OneShot { hz: u64 },
+}
+
+static TIMER: Once<TimerKind> = Once::new();
+
+pub fn timer_kind() -> TimerKind {
+    *TIMER.get().expect("APIC timer not initialised")
+}
+
+fn tsc_deadline_supported() -> bool {
+    // CPUID.01H:ECX bit 24.
+    let ecx = core::arch::x86_64::__cpuid(1).ecx;
+    !cfg!(feature = "timer-oneshot") && ecx & (1 << 24) != 0
+}
+
+pub fn timer_init() {
+    use crate::arch::{idt::TIMER_VECTOR, time};
+    let kind = if tsc_deadline_supported() {
+        write(REG_LVT_TIMER, LVT_TSC_DEADLINE | u64::from(TIMER_VECTOR));
+        TimerKind::TscDeadline
+    } else {
+        // Divide by 1, one-shot, masked while calibrating.
+        write(REG_TIMER_DIVIDE, 0b1011);
+        write(REG_LVT_TIMER, LVT_MASKED | u64::from(TIMER_VECTOR));
+        write(REG_TIMER_INITIAL, u64::from(u32::MAX));
+        let t0 = crate::perf::rdtsc();
+        let span = time::tsc_hz() / 50; // 20 ms
+        while crate::perf::rdtsc() - t0 < span {
+            core::hint::spin_loop();
+        }
+        let elapsed = u64::from(u32::MAX) - read(REG_TIMER_CURRENT);
+        write(REG_TIMER_INITIAL, 0);
+        let hz = elapsed * 50;
+        assert!(hz > 1_000_000, "LAPIC timer calibration failed");
+        write(REG_LVT_TIMER, u64::from(TIMER_VECTOR)); // unmasked, one-shot
+        TimerKind::OneShot { hz }
+    };
+    TIMER.call_once(|| kind);
+    kprintln!("[apic] timer: {kind:?}");
+}
+
+/// Fire the timer interrupt at absolute TSC value `deadline`.
+pub fn timer_arm_tsc(deadline: u64) {
+    match timer_kind() {
+        TimerKind::TscDeadline => {
+            if let Mode::XApic { .. } = mode() {
+                // The LVT write must be globally visible before the deadline MSR.
+                // SAFETY: a plain fence.
+                unsafe { core::arch::x86_64::_mm_mfence() };
+            }
+            // SAFETY: documented MSR; the LVT timer is in TSC-deadline mode.
+            unsafe { Msr::new(IA32_TSC_DEADLINE).write(deadline.max(1)) };
+        }
+        TimerKind::OneShot { hz } => {
+            let now = crate::perf::rdtsc();
+            let delta = deadline.saturating_sub(now).max(1);
+            let ticks = (u128::from(delta) * u128::from(hz)
+                / u128::from(crate::arch::time::tsc_hz()))
+            .clamp(1, u128::from(u32::MAX)) as u64;
+            write(REG_TIMER_INITIAL, ticks);
+        }
+    }
+}
+
+pub fn timer_cancel() {
+    match timer_kind() {
+        // SAFETY: writing zero disarms TSC-deadline mode.
+        TimerKind::TscDeadline => unsafe { Msr::new(IA32_TSC_DEADLINE).write(0) },
+        TimerKind::OneShot { .. } => write(REG_TIMER_INITIAL, 0),
     }
 }

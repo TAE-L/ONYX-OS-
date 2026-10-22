@@ -8,6 +8,8 @@ build = "build.rs"
 [features]
 # Boots, runs the in-kernel self-test suite, reports over serial and exits QEMU.
 selftest = []
+# Force the calibrated one-shot LAPIC timer even when TSC-deadline exists (tests the fallback).
+timer-oneshot = []
 
 [dependencies]
 spin = "0.10"

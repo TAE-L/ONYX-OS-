@@ -18,6 +18,8 @@ unsafe extern "C" {
 /// Vector used by the self-test to prove APIC + IDT delivery end to end.
 pub const TEST_IPI_VECTOR: u8 = 0x40;
 pub const SPURIOUS_VECTOR: u8 = 0xFF;
+/// Local APIC timer: the scheduler's only source of preemption and wakeups.
+pub const TIMER_VECTOR: u8 = 0x30;
 
 #[repr(C)]
 pub struct TrapFrame {
@@ -173,6 +175,11 @@ extern "C" fn isr_dispatch(frame: &mut TrapFrame) {
             BREAKPOINTS.fetch_add(1, SeqCst);
         }
         14 => page_fault(frame),
+        v if v == TIMER_VECTOR => {
+            let entered = crate::perf::rdtsc();
+            apic::eoi();
+            crate::sched::timer_interrupt(entered);
+        }
         v if v == TEST_IPI_VECTOR => {
             TEST_IPIS.fetch_add(1, SeqCst);
             apic::eoi();

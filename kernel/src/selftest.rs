@@ -108,6 +108,50 @@ static TESTS: &[Test] = &[
         name: "isolation: address spaces free every table frame on drop",
         run: isolation_no_leak,
     },
+    Test {
+        name: "time: TSC calibrated and timer kind as configured",
+        run: time_calibrated,
+    },
+    Test {
+        name: "sched: sleep_ns wakes on time, not early",
+        run: sched_sleep_accuracy,
+    },
+    Test {
+        name: "sched: tickless, a 60 ms sleep costs a handful of timer interrupts",
+        run: sched_tickless,
+    },
+    Test {
+        name: "sched: callee-saved registers survive task switches",
+        run: sched_registers,
+    },
+    Test {
+        name: "sched: tasks start with interrupts enabled",
+        run: sched_interrupts_on,
+    },
+    Test {
+        name: "sched: two busy tasks that never yield both get ~equal CPU (preemption)",
+        run: sched_fair_equal,
+    },
+    Test {
+        name: "sched: weight 3:1 gives ~3:1 CPU",
+        run: sched_fair_weighted,
+    },
+    Test {
+        name: "sched: a waking short-slice task preempts a hog (latency, p99 < hog slice)",
+        run: sched_wake_latency,
+    },
+    Test {
+        name: "sched: deadline task gets its reserved share, hog gets the rest",
+        run: sched_deadline_share,
+    },
+    Test {
+        name: "sched: deadline admission refuses over-commitment and releases on exit",
+        run: sched_deadline_admission,
+    },
+    Test {
+        name: "sched: 100 short tasks leave no heap or task leak",
+        run: sched_no_leak,
+    },
 ];
 
 pub fn run() -> ! {
@@ -259,6 +303,7 @@ fn apic_registers() -> TestResult {
 
 fn apic_self_ipi() -> TestResult {
     let before = idt::test_ipis();
+    let was_enabled = x86_64::instructions::interrupts::are_enabled();
     apic::send_self_ipi(idt::TEST_IPI_VECTOR);
     x86_64::instructions::interrupts::enable();
     let mut spins = 0u64;
@@ -266,7 +311,9 @@ fn apic_self_ipi() -> TestResult {
         core::hint::spin_loop();
         spins += 1;
     }
-    x86_64::instructions::interrupts::disable();
+    if !was_enabled {
+        x86_64::instructions::interrupts::disable();
+    }
     ensure!(idt::test_ipis() == before + 1, "self-IPI never arrived");
     Ok(())
 }
@@ -487,5 +534,376 @@ fn isolation_no_leak() -> TestResult {
     }
     ensure!(frame::free_frames() == before, "table frames leaked");
     let _ = mm::PAGE_SIZE;
+    Ok(())
+}
+
+// --- time / scheduler ----------------------------------------------------------------
+
+use crate::arch::time;
+use crate::sched::{self, Class, SpawnError};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+
+static STOP: AtomicBool = AtomicBool::new(false);
+static COUNTS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+fn hog(slot: usize) {
+    while !STOP.load(SeqCst) {
+        COUNTS[slot].fetch_add(1, SeqCst);
+    }
+}
+
+fn wait_exit(ids: &[sched::TaskId]) {
+    for &id in ids {
+        let mut spins = 0;
+        while !sched::has_exited(id) && spins < 5000 {
+            sched::sleep_ns(1_000_000);
+            spins += 1;
+        }
+    }
+}
+
+fn time_calibrated() -> TestResult {
+    let hz = time::tsc_hz();
+    ensure!(
+        (100_000_000..=10_000_000_000).contains(&hz),
+        "TSC frequency implausible"
+    );
+    let kind = apic::timer_kind();
+    #[cfg(feature = "timer-oneshot")]
+    ensure!(
+        matches!(kind, apic::TimerKind::OneShot { .. }),
+        "expected the one-shot fallback timer"
+    );
+    #[cfg(not(feature = "timer-oneshot"))]
+    let _ = kind;
+    kprintln!("       timer = {:?}, tsc = {} MHz", kind, hz / 1_000_000);
+    Ok(())
+}
+
+fn sched_sleep_accuracy() -> TestResult {
+    let mut worst = 0;
+    for _ in 0..5 {
+        let t0 = perf::rdtsc();
+        sched::sleep_ns(10_000_000);
+        let elapsed = time::tsc_to_ns(perf::rdtsc() - t0);
+        ensure!(elapsed >= 10_000_000, "woke before the requested time");
+        worst = worst.max(elapsed - 10_000_000);
+    }
+    kprintln!("       worst oversleep over 5 sleeps: {} us", worst / 1000);
+    ensure!(worst < 20_000_000, "oversleep above 20 ms");
+    Ok(())
+}
+
+fn sched_tickless() -> TestResult {
+    let before = sched::timer_interrupts();
+    sched::sleep_ns(60_000_000);
+    let n = sched::timer_interrupts() - before;
+    kprintln!("       timer interrupts during a 60 ms sleep: {n}");
+    ensure!(n >= 1, "no timer interrupt woke the sleeper");
+    ensure!(n <= 4, "timer is ticking while nothing needs it");
+    Ok(())
+}
+
+core::arch::global_asm!(
+    r#"
+    .section .text.selftest,"ax"
+    .global ctx_regs_check
+    .hidden ctx_regs_check
+// ctx_regs_check(fn [rdi]) -> eax: 0 if every callee-saved register survived `fn`
+ctx_regs_check:
+    push rbp
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    sub rsp, 8
+    mov rbx, 0x1111111111111111
+    mov r12, 0x1212121212121212
+    mov r13, 0x1313131313131313
+    mov r14, 0x1414141414141414
+    mov r15, 0x1515151515151515
+    mov rbp, 0x1616161616161616
+    call rdi
+    mov eax, 1
+    mov rcx, 0x1111111111111111
+    cmp rbx, rcx
+    jne 2f
+    mov rcx, 0x1212121212121212
+    cmp r12, rcx
+    jne 2f
+    mov rcx, 0x1313131313131313
+    cmp r13, rcx
+    jne 2f
+    mov rcx, 0x1414141414141414
+    cmp r14, rcx
+    jne 2f
+    mov rcx, 0x1515151515151515
+    cmp r15, rcx
+    jne 2f
+    mov rcx, 0x1616161616161616
+    cmp rbp, rcx
+    jne 2f
+    xor eax, eax
+2:
+    add rsp, 8
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    pop rbp
+    ret
+"#
+);
+
+unsafe extern "C" {
+    fn ctx_regs_check(f: extern "C" fn()) -> u32;
+}
+
+extern "C" fn yield_c() {
+    sched::yield_now();
+}
+
+static REG_BAD: AtomicU64 = AtomicU64::new(0);
+static REG_DONE: AtomicU64 = AtomicU64::new(0);
+
+fn reg_checker(_: usize) {
+    for _ in 0..300 {
+        // SAFETY: the asm only calls `yield_c` and compares registers.
+        if unsafe { ctx_regs_check(yield_c) } != 0 {
+            REG_BAD.fetch_add(1, SeqCst);
+        }
+    }
+    REG_DONE.fetch_add(1, SeqCst);
+}
+
+fn reg_clobberer(_: usize) {
+    let mut x = 0x9E37_79B9_7F4A_7C15u64;
+    while REG_DONE.load(SeqCst) < 2 {
+        for _ in 0..50 {
+            x = x.rotate_left(7) ^ x.wrapping_mul(0x2545_F491_4F6C_DD1D);
+            core::hint::black_box(x);
+        }
+        sched::yield_now();
+    }
+}
+
+fn sched_registers() -> TestResult {
+    REG_BAD.store(0, SeqCst);
+    REG_DONE.store(0, SeqCst);
+    let ids = [
+        sched::spawn("reg-a", Class::fair(), reg_checker, 0).map_err(|_| "spawn")?,
+        sched::spawn("reg-b", Class::fair(), reg_checker, 0).map_err(|_| "spawn")?,
+        sched::spawn("clobber", Class::fair(), reg_clobberer, 0).map_err(|_| "spawn")?,
+    ];
+    wait_exit(&ids);
+    ensure!(REG_DONE.load(SeqCst) == 2, "checkers did not finish");
+    ensure!(
+        REG_BAD.load(SeqCst) == 0,
+        "a callee-saved register was corrupted"
+    );
+    Ok(())
+}
+
+static IF_SEEN: AtomicUsize = AtomicUsize::new(2);
+
+fn if_probe(_: usize) {
+    IF_SEEN.store(
+        usize::from(x86_64::instructions::interrupts::are_enabled()),
+        SeqCst,
+    );
+}
+
+fn sched_interrupts_on() -> TestResult {
+    IF_SEEN.store(2, SeqCst);
+    let id = sched::spawn("if-probe", Class::fair(), if_probe, 0).map_err(|_| "spawn")?;
+    wait_exit(&[id]);
+    ensure!(
+        IF_SEEN.load(SeqCst) == 1,
+        "new task ran with interrupts disabled"
+    );
+    Ok(())
+}
+
+fn run_hogs(classes: &[Class], window_ms: u64) -> Result<[u64; 4], &'static str> {
+    STOP.store(false, SeqCst);
+    for c in &COUNTS {
+        c.store(0, SeqCst);
+    }
+    let mut ids = alloc::vec::Vec::new();
+    for (slot, class) in classes.iter().enumerate() {
+        ids.push(sched::spawn("hog", *class, hog, slot).map_err(|_| "spawn failed")?);
+    }
+    sched::sleep_ns(window_ms * 1_000_000);
+    let mut cpu = [0u64; 4];
+    for (slot, id) in ids.iter().enumerate() {
+        cpu[slot] = sched::cpu_ns(*id).ok_or("task vanished")?;
+    }
+    STOP.store(true, SeqCst);
+    wait_exit(&ids);
+    Ok(cpu)
+}
+
+fn sched_fair_equal() -> TestResult {
+    let cpu = run_hogs(&[Class::fair(), Class::fair()], 300)?;
+    kprintln!(
+        "       cpu ms: {} / {}",
+        cpu[0] / 1_000_000,
+        cpu[1] / 1_000_000
+    );
+    ensure!(
+        COUNTS[0].load(SeqCst) > 0 && COUNTS[1].load(SeqCst) > 0,
+        "a busy task never ran: no preemption"
+    );
+    let (a, b) = (cpu[0].max(1), cpu[1].max(1));
+    ensure!(
+        a * 10 > b * 7 && b * 10 > a * 7,
+        "CPU split is not within 30% of equal"
+    );
+    Ok(())
+}
+
+fn sched_fair_weighted() -> TestResult {
+    let cpu = run_hogs(
+        &[
+            Class::fair_with(1024, 3_000_000),
+            Class::fair_with(3072, 3_000_000),
+        ],
+        400,
+    )?;
+    kprintln!(
+        "       cpu ms: {} / {} (weights 1:3)",
+        cpu[0] / 1_000_000,
+        cpu[1] / 1_000_000
+    );
+    let ratio_x100 = cpu[1] * 100 / cpu[0].max(1);
+    ensure!(
+        (220..=400).contains(&ratio_x100),
+        "weight 3 did not get about 3x the CPU"
+    );
+    Ok(())
+}
+
+static LAT: Histogram = Histogram::new();
+
+fn latency_sleeper(_: usize) {
+    for _ in 0..50 {
+        let target = perf::rdtsc() + time::ns_to_tsc(2_000_000);
+        sched::sleep_until_tsc(target);
+        LAT.record(time::tsc_to_ns(perf::rdtsc() - target));
+    }
+}
+
+fn sched_wake_latency() -> TestResult {
+    STOP.store(false, SeqCst);
+    let hog_id =
+        sched::spawn("hog", Class::fair_with(1024, 3_000_000), hog, 0).map_err(|_| "spawn")?;
+    let id = sched::spawn("lat", Class::fair_with(1024, 300_000), latency_sleeper, 0)
+        .map_err(|_| "spawn")?;
+    wait_exit(&[id]);
+    STOP.store(true, SeqCst);
+    wait_exit(&[hog_id]);
+    ensure!(LAT.count() == 50, "sleeper did not complete 50 wakeups");
+    let (p50, p99, max) = (LAT.percentile(50), LAT.percentile(99), LAT.max());
+    kprintln!(
+        "       wake latency vs a running hog: p50<={} us p99<={} us max={} us (software emulation: not a hardware number)",
+        p50 / 1000,
+        p99 / 1000,
+        max / 1000
+    );
+    ensure!(
+        p99 < 3_000_000,
+        "p99 wake latency exceeded the hog's slice: no wake preemption"
+    );
+    ensure!(
+        sched::WAKE_LATENCY.count() >= 50,
+        "global wake histogram not fed"
+    );
+    ensure!(
+        sched::context_switches() > 100,
+        "too few context switches recorded"
+    );
+    Ok(())
+}
+
+fn sched_deadline_share() -> TestResult {
+    // 2 ms every 10 ms = 20%.
+    let cpu = run_hogs(
+        &[
+            Class::Deadline {
+                runtime_ns: 2_000_000,
+                period_ns: 10_000_000,
+            },
+            Class::fair(),
+        ],
+        400,
+    )?;
+    kprintln!(
+        "       cpu ms: deadline {} / fair hog {} (of 400, reserved 20%)",
+        cpu[0] / 1_000_000,
+        cpu[1] / 1_000_000
+    );
+    ensure!(
+        (60_000_000..=100_000_000).contains(&cpu[0]),
+        "deadline task did not get ~20% (80 ms of 400)"
+    );
+    ensure!(cpu[1] > 200_000_000, "the fair task was starved");
+    Ok(())
+}
+
+fn sched_deadline_admission() -> TestResult {
+    STOP.store(false, SeqCst);
+    let base = sched::deadline_reserved_ppm();
+    let a = sched::spawn(
+        "dl-a",
+        Class::Deadline {
+            runtime_ns: 6_000_000,
+            period_ns: 10_000_000,
+        },
+        hog,
+        0,
+    )
+    .map_err(|_| "60% should be accepted")?;
+    let refused = sched::spawn(
+        "dl-b",
+        Class::Deadline {
+            runtime_ns: 3_000_000,
+            period_ns: 10_000_000,
+        },
+        hog,
+        1,
+    );
+    ensure!(
+        refused == Err(SpawnError::OverCommitted),
+        "90% total was accepted"
+    );
+    ensure!(
+        sched::deadline_reserved_ppm() == base + 600_000,
+        "refused task left a reservation behind"
+    );
+    STOP.store(true, SeqCst);
+    wait_exit(&[a]);
+    sched::sleep_ns(2_000_000);
+    ensure!(
+        sched::deadline_reserved_ppm() == base,
+        "reservation not released on exit"
+    );
+    Ok(())
+}
+
+fn nop_task(_: usize) {}
+
+fn sched_no_leak() -> TestResult {
+    sched::sleep_ns(3_000_000); // reap anything left by earlier tests
+    let (tasks0, heap0) = (sched::task_count(), mm::heap::used());
+    for _ in 0..100 {
+        let id = sched::spawn("nop", Class::fair(), nop_task, 0).map_err(|_| "spawn")?;
+        wait_exit(&[id]);
+    }
+    sched::sleep_ns(3_000_000);
+    let (tasks1, heap1) = (sched::task_count(), mm::heap::used());
+    ensure!(tasks1 == tasks0, "exited tasks were not reaped");
+    ensure!(heap1 <= heap0 + 8192, "heap grew after 100 task lifecycles");
     Ok(())
 }

@@ -11,12 +11,20 @@ Rebuild from scratch; the design and phase plan live in the design doc
 |---|---|
 | 0 Tooling and harness | done |
 | 1 Boot and memory | done (gate passed, see below) |
-| 2 Scheduler and timers | next |
+| 2a Scheduler and timers, one CPU | done (30/30 tests, gate measured under emulation only) |
+| 2b SMP: per-CPU run queues, IPIs, TSC-deadline run on hardware | next |
 
 Phase 1 gate: *two address spaces stay isolated*. Proven by a hardware test
 (`ISOLATION` in the self-test): the same virtual address is mapped to different
 frames in two address spaces, each reads its own byte under its own CR3, and a
 third space and the kernel space take a real page fault on that address.
+
+Phase 2a: tickless APIC timer (TSC-deadline, or calibrated one-shot fallback), kernel
+tasks with context switching and timer preemption, an EEVDF fair class (weights and
+per-task slices), a deadline class (budget per period, earliest deadline first,
+admission-controlled at 80%), sleep/wake, and a wake-latency histogram.
+Gate: *wake-latency p99 is measured*; in the self-test a 300 us-slice sleeper
+preempting a busy task shows p99 well under the busy task's 3 ms slice.
 
 ## Use
 
@@ -60,8 +68,19 @@ Only one VM runs at a time (an OS file lock enforces it).
   x2APIC path needs a run under KVM/WHPX or on hardware before it is trusted.
 - Isolation is proven from ring 0 by switching CR3. Ring-3 execution arrives
   with Phase 3.
-- Frame allocator is one bitmap behind one lock; heap is a linked list. Both
-  are replaced in Phase 2 (per-CPU caches). Bootloader-reclaimable memory is
-  not yet returned to the allocator.
+- The scheduler runs on one CPU. Run queues are scanned linearly (fine for tens
+  of tasks, to be replaced by an ordered tree) and there is no load balancing yet.
+- QEMU's software CPU has no TSC-deadline timer, so only the calibrated one-shot
+  timer path has run. The TSC-deadline path (used when the CPU has it, as your i3
+  does) is untested until run under KVM/WHPX or on hardware. The one-shot path
+  can be forced with `--features timer-oneshot`.
+- Wake-latency numbers from the self-test come from software emulation and are
+  not hardware results.
+- Task stacks are 64 KiB heap blocks with an overflow canary checked at every
+  switch, not guard pages. No FPU/SSE state is saved yet (the kernel target uses
+  none); Phase 3 adds XSAVE for user tasks.
+- Frame allocator is one bitmap behind one lock and the heap is a linked list
+  (both interrupt-safe). Per-CPU caches come with SMP. Bootloader-reclaimable
+  memory is not yet returned to the allocator.
 - Toolchain: stable Rust with `RUSTC_BOOTSTRAP=1` and `-Zbuild-std`, because
   the kernel needs `core`/`alloc` built from source for the bare-metal target.

@@ -22,9 +22,11 @@ mod panic;
 mod perf;
 #[cfg(feature = "selftest")]
 mod qemu;
+mod sched;
 #[cfg(feature = "selftest")]
 mod selftest;
 mod serial;
+mod sync;
 
 pub const NAME: &str = "OnyxOS";
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -63,6 +65,10 @@ extern "C" fn kmain() -> ! {
     mm::paging::init_kernel_space(info);
     mm::heap::init(HEAP_BYTES);
     arch::apic::init();
+    arch::time::init();
+    arch::apic::timer_init();
+    sched::init();
+    x86_64::instructions::interrupts::enable();
 
     kprintln!(
         "boot complete: {} MiB free of {} MiB",
@@ -75,7 +81,9 @@ extern "C" fn kmain() -> ! {
 
     #[cfg(not(feature = "selftest"))]
     {
-        kprintln!("idle (Phase 1 has no scheduler yet)");
-        arch::cpu::halt_forever()
+        kprintln!("idle");
+        loop {
+            sched::sleep_ns(1_000_000_000);
+        }
     }
 }

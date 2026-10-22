@@ -12,8 +12,9 @@
 use super::{PAGE_SIZE, frame, phys_to_virt};
 use crate::boot::BootInfo;
 use crate::limine;
+use crate::sync::IrqMutex as Mutex;
 use core::sync::atomic::{AtomicU64, Ordering};
-use spin::{Mutex, Once};
+use spin::Once;
 use x86_64::PhysAddr;
 use x86_64::VirtAddr;
 use x86_64::instructions::tlb;

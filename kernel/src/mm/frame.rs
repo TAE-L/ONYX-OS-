@@ -11,7 +11,7 @@
 use super::{PAGE_SIZE, align_down, align_up, phys_to_virt};
 use crate::boot::BootInfo;
 use crate::limine::MEMMAP_USABLE;
-use spin::Mutex;
+use crate::sync::IrqMutex as Mutex;
 
 const LOW_RESERVED: u64 = 1 << 20;
 

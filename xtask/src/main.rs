@@ -30,6 +30,12 @@ struct Opts {
     release: bool,
     accel: Option<String>,
     timeout: Duration,
+    smp: usize,
+}
+
+/// Virtual CPUs for the VM: the host's, capped at 4 (emulation gets noisy beyond that).
+fn default_smp() -> usize {
+    std::thread::available_parallelism().map_or(2, |n| n.get().clamp(2, 4))
 }
 
 fn root() -> PathBuf {
@@ -44,6 +50,7 @@ fn parse(args: &[String]) -> Res<Opts> {
         release: false,
         accel: None,
         timeout: Duration::from_secs(180),
+        smp: default_smp(),
     };
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -57,6 +64,13 @@ fn parse(args: &[String]) -> Res<Opts> {
                     .parse()
                     .map_err(|_| "--timeout must be a number")?;
                 o.timeout = Duration::from_secs(s);
+            }
+            "--smp" => {
+                o.smp = it
+                    .next()
+                    .ok_or("--smp needs a CPU count")?
+                    .parse()
+                    .map_err(|_| "--smp must be a number")?;
             }
             other => return Err(format!("unknown option {other}")),
         }
@@ -76,7 +90,7 @@ fn main() -> ExitCode {
         "test" => parse(rest).and_then(|o| test(&o)),
         "check" => check(),
         "clean" => fs::remove_dir_all(root().join("target")).map_err(|e| e.to_string()),
-        _ => Err("usage: cargo xtask <build|run|test|check|clean> [--release] [--accel kvm|tcg|whpx] [--timeout SECS]".into()),
+        _ => Err("usage: cargo xtask <build|run|test|check|clean> [--release] [--accel kvm|tcg|whpx] [--timeout SECS] [--smp N]".into()),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -250,12 +264,13 @@ impl VmLock {
     }
 }
 
-fn qemu_command(esp: &Path, serial: &str, accel: &str) -> Res<Command> {
+fn qemu_command(esp: &Path, serial: &str, accel: &str, smp: usize) -> Res<Command> {
     let (code, vars_template) = find_ovmf()?;
     let vars = root().join("target").join("ovmf_vars.fd");
     fs::copy(&vars_template, &vars).map_err(|e| format!("copy OVMF vars: {e}"))?;
     let mut c = Command::new(qemu_binary()?);
-    c.args(["-machine", "q35", "-cpu", "max", "-m", "512M", "-smp", "1"])
+    c.args(["-machine", "q35", "-cpu", "max", "-m", "512M"])
+        .args(["-smp", &smp.to_string()])
         .args(["-accel", accel])
         .args(["-display", "none", "-no-reboot"])
         .args(["-serial", serial])
@@ -281,7 +296,7 @@ fn run(o: &Opts) -> Res<()> {
     let _lock = VmLock::acquire()?;
     let accel = pick_accel(o);
     eprintln!("booting under QEMU ({accel}); Ctrl-C to stop");
-    let mut c = qemu_command(&esp, "stdio", &accel)?;
+    let mut c = qemu_command(&esp, "stdio", &accel, o.smp)?;
     c.status().map(|_| ()).map_err(|e| e.to_string())
 }
 
@@ -292,7 +307,7 @@ fn test(o: &Opts) -> Res<()> {
     let accel = pick_accel(o);
     let log = root().join("target").join("serial.log");
     let _ = fs::remove_file(&log);
-    let mut c = qemu_command(&esp, &format!("file:{}", log.display()), &accel)?;
+    let mut c = qemu_command(&esp, &format!("file:{}", log.display()), &accel, o.smp)?;
     c.stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
@@ -383,5 +398,6 @@ fn check() -> Res<()> {
         release: false,
         accel: None,
         timeout: Duration::from_secs(180),
+        smp: default_smp(),
     })
 }

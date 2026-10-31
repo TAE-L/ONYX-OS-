@@ -20,6 +20,8 @@ pub const TEST_IPI_VECTOR: u8 = 0x40;
 pub const SPURIOUS_VECTOR: u8 = 0xFF;
 /// Local APIC timer: the scheduler's only source of preemption and wakeups.
 pub const TIMER_VECTOR: u8 = 0x30;
+/// Inter-processor "look at your run queue" kick.
+pub const RESCHED_VECTOR: u8 = 0x31;
 
 #[repr(C)]
 pub struct TrapFrame {
@@ -122,6 +124,14 @@ pub fn init() {
         }
         gates
     });
+    load_on_this_cpu();
+    let _ = idt;
+    kprintln!("[idt] loaded: 256 vectors");
+}
+
+/// Point this CPU's IDTR at the shared table (every CPU uses the same IDT).
+pub fn load_on_this_cpu() {
+    let idt = IDT.get().expect("IDT not built");
     let idtr = Idtr {
         limit: (size_of::<[Gate; 256]>() - 1) as u16,
         base: idt.as_ptr() as u64,
@@ -130,7 +140,6 @@ pub fn init() {
     unsafe {
         core::arch::asm!("lidt [{}]", in(reg) &idtr, options(readonly, nostack, preserves_flags));
     }
-    kprintln!("[idt] loaded: 256 vectors");
 }
 
 const EXCEPTION_NAMES: [&str; 32] = [
@@ -179,6 +188,11 @@ extern "C" fn isr_dispatch(frame: &mut TrapFrame) {
             let entered = crate::perf::rdtsc();
             apic::eoi();
             crate::sched::timer_interrupt(entered);
+        }
+        v if v == RESCHED_VECTOR => {
+            let entered = crate::perf::rdtsc();
+            apic::eoi();
+            crate::sched::resched_ipi(entered);
         }
         v if v == TEST_IPI_VECTOR => {
             TEST_IPIS.fetch_add(1, SeqCst);

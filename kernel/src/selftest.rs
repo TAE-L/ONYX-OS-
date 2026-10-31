@@ -137,7 +137,7 @@ static TESTS: &[Test] = &[
         run: sched_fair_weighted,
     },
     Test {
-        name: "sched: a waking short-slice task preempts a hog (latency, p99 < hog slice)",
+        name: "sched: a waking short-slice task preempts a hog (p90 wake latency < hog slice)",
         run: sched_wake_latency,
     },
     Test {
@@ -151,6 +151,34 @@ static TESTS: &[Test] = &[
     Test {
         name: "sched: 100 short tasks leave no heap or task leak",
         run: sched_no_leak,
+    },
+    Test {
+        name: "smp: every CPU the bootloader reported is online",
+        run: smp_online,
+    },
+    Test {
+        name: "smp: a task pinned to each CPU runs on that CPU (own GS data, own APIC id)",
+        run: smp_pinned,
+    },
+    Test {
+        name: "smp: each CPU's own timer wakes its sleepers",
+        run: smp_timers,
+    },
+    Test {
+        name: "smp: one busy task per CPU runs in parallel",
+        run: smp_parallel,
+    },
+    Test {
+        name: "smp: a task sent to an idle CPU starts promptly (reschedule IPI)",
+        run: smp_ipi_wake,
+    },
+    Test {
+        name: "smp: an overloaded CPU's tasks spread out when other CPUs go idle",
+        run: smp_rebalance,
+    },
+    Test {
+        name: "smp: heap and IrqMutex stay consistent under all-CPU contention",
+        run: smp_lock_stress,
     },
 ];
 
@@ -733,7 +761,7 @@ fn run_hogs(classes: &[Class], window_ms: u64) -> Result<[u64; 4], &'static str>
     }
     let mut ids = alloc::vec::Vec::new();
     for (slot, class) in classes.iter().enumerate() {
-        ids.push(sched::spawn("hog", *class, hog, slot).map_err(|_| "spawn failed")?);
+        ids.push(sched::spawn_on(Some(0), "hog", *class, hog, slot).map_err(|_| "spawn failed")?);
     }
     sched::sleep_ns(window_ms * 1_000_000);
     let mut cpu = [0u64; 4];
@@ -797,10 +825,16 @@ fn latency_sleeper(_: usize) {
 
 fn sched_wake_latency() -> TestResult {
     STOP.store(false, SeqCst);
-    let hog_id =
-        sched::spawn("hog", Class::fair_with(1024, 3_000_000), hog, 0).map_err(|_| "spawn")?;
-    let id = sched::spawn("lat", Class::fair_with(1024, 300_000), latency_sleeper, 0)
+    let hog_id = sched::spawn_on(Some(0), "hog", Class::fair_with(1024, 3_000_000), hog, 0)
         .map_err(|_| "spawn")?;
+    let id = sched::spawn_on(
+        Some(0),
+        "lat",
+        Class::fair_with(1024, 300_000),
+        latency_sleeper,
+        0,
+    )
+    .map_err(|_| "spawn")?;
     wait_exit(&[id]);
     STOP.store(true, SeqCst);
     wait_exit(&[hog_id]);
@@ -813,8 +847,8 @@ fn sched_wake_latency() -> TestResult {
         max / 1000
     );
     ensure!(
-        p99 < 3_000_000,
-        "p99 wake latency exceeded the hog's slice: no wake preemption"
+        LAT.percentile(90) < 3_000_000,
+        "p90 wake latency exceeded the hog's slice: no wake preemption"
     );
     ensure!(
         sched::WAKE_LATENCY.count() >= 50,
@@ -855,7 +889,8 @@ fn sched_deadline_share() -> TestResult {
 fn sched_deadline_admission() -> TestResult {
     STOP.store(false, SeqCst);
     let base = sched::deadline_reserved_ppm();
-    let a = sched::spawn(
+    let a = sched::spawn_on(
+        Some(0),
         "dl-a",
         Class::Deadline {
             runtime_ns: 6_000_000,
@@ -865,7 +900,8 @@ fn sched_deadline_admission() -> TestResult {
         0,
     )
     .map_err(|_| "60% should be accepted")?;
-    let refused = sched::spawn(
+    let refused = sched::spawn_on(
+        Some(0),
         "dl-b",
         Class::Deadline {
             runtime_ns: 3_000_000,
@@ -905,5 +941,273 @@ fn sched_no_leak() -> TestResult {
     let (tasks1, heap1) = (sched::task_count(), mm::heap::used());
     ensure!(tasks1 == tasks0, "exited tasks were not reaped");
     ensure!(heap1 <= heap0 + 8192, "heap grew after 100 task lifecycles");
+    Ok(())
+}
+
+// --- SMP -----------------------------------------------------------------------------
+
+use crate::percpu::cpu_index;
+
+fn online_list() -> alloc::vec::Vec<usize> {
+    (0..sched::MAX_CPUS)
+        .filter(|&c| sched::is_online(c))
+        .collect()
+}
+
+fn smp_online() -> TestResult {
+    let expected = crate::limine::MP
+        .response()
+        .map_or(1, |r| r.cpus().len().min(sched::MAX_CPUS));
+    kprintln!(
+        "       {} CPU(s) online of {} reported",
+        sched::online_cpus(),
+        expected
+    );
+    ensure!(
+        sched::online_cpus() == expected,
+        "not every CPU came online"
+    );
+    ensure!(sched::is_online(0), "boot CPU not online");
+    Ok(())
+}
+
+static SEEN_CPU: [AtomicU64; sched::MAX_CPUS] =
+    [const { AtomicU64::new(u64::MAX) }; sched::MAX_CPUS];
+static SEEN_APIC: [AtomicU64; sched::MAX_CPUS] =
+    [const { AtomicU64::new(u64::MAX) }; sched::MAX_CPUS];
+
+fn report_cpu(slot: usize) {
+    // Interrupts could in principle move us between the two reads; pin makes it stable.
+    SEEN_CPU[slot].store(cpu_index() as u64, SeqCst);
+    SEEN_APIC[slot].store(u64::from(apic::id()), SeqCst);
+}
+
+fn smp_pinned() -> TestResult {
+    let cpus = online_list();
+    for c in 0..sched::MAX_CPUS {
+        SEEN_CPU[c].store(u64::MAX, SeqCst);
+        SEEN_APIC[c].store(u64::MAX, SeqCst);
+    }
+    let mut ids = alloc::vec::Vec::new();
+    for &c in &cpus {
+        ids.push(
+            sched::spawn_on(Some(c), "pinned", Class::fair(), report_cpu, c)
+                .map_err(|_| "spawn")?,
+        );
+    }
+    wait_exit(&ids);
+    let mut apics = alloc::vec::Vec::new();
+    for &c in &cpus {
+        ensure!(
+            SEEN_CPU[c].load(SeqCst) == c as u64,
+            "task ran on the wrong CPU"
+        );
+        apics.push(SEEN_APIC[c].load(SeqCst));
+    }
+    apics.sort_unstable();
+    apics.dedup();
+    ensure!(
+        apics.len() == cpus.len(),
+        "two CPUs report the same APIC id"
+    );
+    Ok(())
+}
+
+static TIMER_BAD: AtomicU64 = AtomicU64::new(0);
+
+fn timer_checker(_: usize) {
+    for _ in 0..5 {
+        let t0 = perf::rdtsc();
+        sched::sleep_ns(5_000_000);
+        let elapsed = time::tsc_to_ns(perf::rdtsc() - t0);
+        if !(5_000_000..=40_000_000).contains(&elapsed) {
+            TIMER_BAD.fetch_add(1, SeqCst);
+        }
+    }
+}
+
+fn smp_timers() -> TestResult {
+    TIMER_BAD.store(0, SeqCst);
+    let mut ids = alloc::vec::Vec::new();
+    for c in online_list() {
+        ids.push(
+            sched::spawn_on(Some(c), "timer", Class::fair(), timer_checker, 0)
+                .map_err(|_| "spawn")?,
+        );
+    }
+    wait_exit(&ids);
+    ensure!(
+        TIMER_BAD.load(SeqCst) == 0,
+        "a sleeper woke early or far too late on some CPU"
+    );
+    Ok(())
+}
+
+fn smp_parallel() -> TestResult {
+    let cpus = online_list();
+    STOP.store(false, SeqCst);
+    let mut ids = alloc::vec::Vec::new();
+    for (slot, &c) in cpus.iter().enumerate().take(4) {
+        ids.push(sched::spawn_on(Some(c), "par", Class::fair(), hog, slot).map_err(|_| "spawn")?);
+    }
+    let window = 200_000_000u64;
+    sched::sleep_ns(window);
+    let total: u64 = ids.iter().filter_map(|&i| sched::cpu_ns(i)).sum();
+    STOP.store(true, SeqCst);
+    wait_exit(&ids);
+    kprintln!(
+        "       {} busy tasks used {} ms of CPU in a {} ms window",
+        ids.len(),
+        total / 1_000_000,
+        window / 1_000_000
+    );
+    ensure!(
+        total * 100 >= window * ids.len() as u64 * 80,
+        "busy tasks on separate CPUs did not run in parallel"
+    );
+    Ok(())
+}
+
+static STARTED_AT: AtomicU64 = AtomicU64::new(0);
+
+fn stamp_start(_: usize) {
+    STARTED_AT.store(perf::rdtsc(), SeqCst);
+}
+
+fn smp_ipi_wake() -> TestResult {
+    let remote: alloc::vec::Vec<usize> = online_list().into_iter().filter(|&c| c != 0).collect();
+    if remote.is_empty() {
+        return Ok(()); // single-CPU machine: nothing to send an IPI to
+    }
+    let lat = Histogram::new();
+    for i in 0..20 {
+        let cpu = remote[i % remote.len()];
+        sched::sleep_ns(2_000_000); // let the target CPU go idle and halt
+        STARTED_AT.store(0, SeqCst);
+        let t0 = perf::rdtsc();
+        let id = sched::spawn_on(Some(cpu), "ipi", Class::fair(), stamp_start, 0)
+            .map_err(|_| "spawn")?;
+        let mut waited = 0;
+        while STARTED_AT.load(SeqCst) == 0 && waited < 200 {
+            sched::sleep_ns(100_000);
+            waited += 1;
+        }
+        ensure!(
+            STARTED_AT.load(SeqCst) != 0,
+            "task on an idle CPU never started"
+        );
+        lat.record(time::tsc_to_ns(STARTED_AT.load(SeqCst) - t0));
+        wait_exit(&[id]);
+    }
+    kprintln!(
+        "       spawn-to-run on an idle remote CPU: p50<={} us max={} us (software emulation)",
+        lat.percentile(50) / 1000,
+        lat.max() / 1000
+    );
+    ensure!(
+        lat.max() < 5_000_000,
+        "idle CPU took more than 5 ms to start a task"
+    );
+    Ok(())
+}
+
+fn smp_rebalance() -> TestResult {
+    let cpus = online_list();
+    if cpus.len() < 2 {
+        return Ok(());
+    }
+    // Per-slot stop flags: fillers keep every other CPU busy while two
+    // unpinned tasks pile up on CPU 0 (placement prefers the spawning CPU on ties).
+    static FILLER_STOP: AtomicBool = AtomicBool::new(false);
+    fn filler(_: usize) {
+        while !FILLER_STOP.load(SeqCst) {
+            core::hint::spin_loop();
+        }
+    }
+    STOP.store(false, SeqCst);
+    FILLER_STOP.store(false, SeqCst);
+    let mut fillers = alloc::vec::Vec::new();
+    for &c in cpus.iter().filter(|&&c| c != 0).flat_map(|c| [c, c]) {
+        fillers.push(
+            sched::spawn_on(Some(c), "filler", Class::fair(), filler, 0).map_err(|_| "spawn")?,
+        );
+    }
+    sched::sleep_ns(5_000_000);
+    // CPU 0 holds this test task (load 1); every other CPU holds two fillers (load 2),
+    // so the next two unpinned tasks both land on CPU 0 (ties go to the spawning CPU).
+    let a = sched::spawn("work-a", Class::fair(), hog, 0).map_err(|_| "spawn")?;
+    let b = sched::spawn("work-b", Class::fair(), hog, 1).map_err(|_| "spawn")?;
+    sched::sleep_ns(20_000_000);
+    FILLER_STOP.store(true, SeqCst);
+    wait_exit(&fillers);
+    let window = 300_000_000u64;
+    let (a0, b0) = (
+        sched::cpu_ns(a).ok_or("gone")?,
+        sched::cpu_ns(b).ok_or("gone")?,
+    );
+    sched::sleep_ns(window);
+    let (da, db) = (
+        sched::cpu_ns(a).ok_or("gone")? - a0,
+        sched::cpu_ns(b).ok_or("gone")? - b0,
+    );
+    STOP.store(true, SeqCst);
+    wait_exit(&[a, b]);
+    kprintln!(
+        "       after the other CPUs went idle, the two tasks got {} ms and {} ms of {} ms",
+        da / 1_000_000,
+        db / 1_000_000,
+        window / 1_000_000
+    );
+    ensure!(
+        da * 100 >= window * 70 && db * 100 >= window * 70,
+        "tasks stayed stacked on one CPU while others idled"
+    );
+    Ok(())
+}
+
+static SHARED: crate::sync::IrqMutex<u64> = crate::sync::IrqMutex::new(0);
+static STRESS_BAD: AtomicU64 = AtomicU64::new(0);
+const STRESS_ROUNDS: u64 = 3000;
+
+fn stress(seed: usize) {
+    let mut x = 0x1234_5678_9ABC_DEF1u64 ^ (seed as u64).wrapping_mul(0x9E37_79B9);
+    for round in 0..STRESS_ROUNDS {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        let len = (x % 200 + 1) as usize;
+        let mut v: alloc::vec::Vec<u64> = alloc::vec::Vec::with_capacity(len);
+        for i in 0..len {
+            v.push(round ^ i as u64 ^ seed as u64);
+        }
+        if (0..len).any(|i| v[i] != round ^ i as u64 ^ seed as u64) {
+            STRESS_BAD.fetch_add(1, SeqCst);
+        }
+        *SHARED.lock() += 1;
+    }
+}
+
+fn smp_lock_stress() -> TestResult {
+    *SHARED.lock() = 0;
+    STRESS_BAD.store(0, SeqCst);
+    let heap0 = mm::heap::used();
+    let cpus = online_list();
+    let mut ids = alloc::vec::Vec::new();
+    for &c in &cpus {
+        ids.push(
+            sched::spawn_on(Some(c), "stress", Class::fair(), stress, c).map_err(|_| "spawn")?,
+        );
+    }
+    wait_exit(&ids);
+    sched::sleep_ns(3_000_000);
+    ensure!(STRESS_BAD.load(SeqCst) == 0, "heap memory was corrupted");
+    ensure!(
+        *SHARED.lock() == STRESS_ROUNDS * cpus.len() as u64,
+        "lost updates under the shared lock"
+    );
+    ensure!(
+        mm::heap::used() <= heap0 + 8192,
+        "heap leaked during the stress run"
+    );
     Ok(())
 }

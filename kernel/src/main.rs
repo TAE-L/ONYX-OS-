@@ -19,6 +19,7 @@ mod boot;
 mod limine;
 mod mm;
 mod panic;
+mod percpu;
 mod perf;
 #[cfg(feature = "selftest")]
 mod qemu;
@@ -26,6 +27,7 @@ mod sched;
 #[cfg(feature = "selftest")]
 mod selftest;
 mod serial;
+mod smp;
 mod sync;
 
 pub const NAME: &str = "OnyxOS";
@@ -67,7 +69,9 @@ extern "C" fn kmain() -> ! {
     arch::apic::init();
     arch::time::init();
     arch::apic::timer_init();
-    sched::init();
+    percpu::install(0, arch::apic::id());
+    sched::init(arch::apic::id());
+    smp::start_aps();
     x86_64::instructions::interrupts::enable();
 
     kprintln!(

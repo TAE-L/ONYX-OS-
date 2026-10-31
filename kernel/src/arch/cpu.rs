@@ -35,6 +35,10 @@ pub fn features() -> Features {
 }
 
 pub fn init() {
+    init_quiet(false);
+}
+
+pub fn init_quiet(quiet: bool) {
     let f = features();
     assert!(f.nx, "CPU lacks NX support; OnyxOS requires it");
     assert!(f.apic, "CPU lacks a local APIC; OnyxOS requires it");
@@ -55,6 +59,9 @@ pub fn init() {
                 c.insert(Cr4Flags::USER_MODE_INSTRUCTION_PREVENTION);
             }
         });
+    }
+    if quiet {
+        return;
     }
     kprintln!(
         "[cpu] nx=on smep={} smap={} umip={} 1gib-pages={} invariant-tsc={}",

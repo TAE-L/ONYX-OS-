@@ -11,18 +11,21 @@ Rebuild from scratch; the design and phase plan live in the design doc
 |---|---|
 | 0 Tooling and harness | done |
 | 1 Boot and memory | done (gate passed, see below) |
-| 2a Scheduler and timers, one CPU | done (30/30 tests, gate measured under emulation only) |
-| 2b SMP: per-CPU run queues, IPIs, TSC-deadline run on hardware | next |
+| 2 Scheduler, timers, SMP | done in emulation (37/37 tests on 1, 2 and 4 CPUs). TSC-deadline and hardware latency numbers still need KVM/WHPX or real hardware |
+| 3 Userspace and syscalls | next |
 
 Phase 1 gate: *two address spaces stay isolated*. Proven by a hardware test
 (`ISOLATION` in the self-test): the same virtual address is mapped to different
 frames in two address spaces, each reads its own byte under its own CR3, and a
 third space and the kernel space take a real page fault on that address.
 
-Phase 2a: tickless APIC timer (TSC-deadline, or calibrated one-shot fallback), kernel
+Phase 2: tickless APIC timer (TSC-deadline, or calibrated one-shot fallback), kernel
 tasks with context switching and timer preemption, an EEVDF fair class (weights and
 per-task slices), a deadline class (budget per period, earliest deadline first,
-admission-controlled at 80%), sleep/wake, and a wake-latency histogram.
+admission-controlled at 80% per CPU), sleep/wake, and a wake-latency histogram.
+SMP: CPUs start through Limine, each with its own GDT/TSS, timer and run queue;
+reschedule IPIs wake idle CPUs; an idle CPU steals from a loaded one, a loaded
+CPU pushes to a clearly emptier one; tasks can be pinned to a CPU.
 Gate: *wake-latency p99 is measured*; in the self-test a 300 us-slice sleeper
 preempting a busy task shows p99 well under the busy task's 3 ms slice.
 
@@ -39,6 +42,7 @@ cargo xtask check     # rustfmt + clippy -D warnings + test
 cargo xtask build [--release]
 ```
 
+`--smp N` sets the VM's CPU count (default: host CPUs, 2 to 4).
 Overrides: `ONYX_QEMU`, `ONYX_OVMF_CODE`, `ONYX_OVMF_VARS`, `--accel kvm|tcg|whpx`.
 Only one VM runs at a time (an OS file lock enforces it).
 
@@ -68,8 +72,14 @@ Only one VM runs at a time (an OS file lock enforces it).
   x2APIC path needs a run under KVM/WHPX or on hardware before it is trusted.
 - Isolation is proven from ring 0 by switching CR3. Ring-3 execution arrives
   with Phase 3.
-- The scheduler runs on one CPU. Run queues are scanned linearly (fine for tens
-  of tasks, to be replaced by an ordered tree) and there is no load balancing yet.
+- Run queues are scanned linearly (fine for tens of tasks, to be replaced by an
+  ordered tree). Balancing is simple: idle-steal plus push when a CPU is 2+ tasks
+  ahead; deadline tasks are placed once and never migrate. No NUMA/SMT/cache
+  awareness yet.
+- SMP assumes the TSC is synchronised across CPUs (true under QEMU and on
+  invariant-TSC hardware). Kernel page-table changes made after boot would need
+  a TLB shootdown IPI; none are made yet, Phase 3 adds it. GS base is per-CPU
+  data; `swapgs` handling arrives with user mode.
 - QEMU's software CPU has no TSC-deadline timer, so only the calibrated one-shot
   timer path has run. The TSC-deadline path (used when the CPU has it, as your i3
   does) is untested until run under KVM/WHPX or on hardware. The one-shot path

@@ -88,6 +88,39 @@ fn disable_pic() {
     }
 }
 
+/// Bring this CPU's local APIC up in the mode the boot CPU chose.
+pub fn init_ap() {
+    // SAFETY: reading the APIC base MSR.
+    let base_msr = unsafe { Msr::new(IA32_APIC_BASE).read() };
+    // SAFETY: the same documented enable sequence as the boot CPU.
+    unsafe {
+        Msr::new(IA32_APIC_BASE).write(base_msr | APIC_ENABLE);
+        if mode() == Mode::X2Apic {
+            Msr::new(IA32_APIC_BASE).write(base_msr | APIC_ENABLE | X2APIC_ENABLE);
+        }
+    }
+    write(REG_TPR, 0);
+    write(REG_SVR, 0x100 | u64::from(SPURIOUS_VECTOR));
+}
+
+/// Send a fixed, edge-triggered IPI to the CPU with local APIC id `dest`.
+pub fn send_ipi(dest: u32, vector: u8) {
+    x86_64::instructions::interrupts::without_interrupts(|| match mode() {
+        // SAFETY: documented ICR MSR.
+        Mode::X2Apic => unsafe {
+            Msr::new(0x830).write((u64::from(dest) << 32) | u64::from(vector));
+        },
+        Mode::XApic { .. } => {
+            write(0x310, u64::from(dest) << 24);
+            write(REG_ICR_LOW, u64::from(vector));
+            // Delivery-status bit: wait until the APIC has accepted it.
+            while read(REG_ICR_LOW) & (1 << 12) != 0 {
+                core::hint::spin_loop();
+            }
+        }
+    });
+}
+
 pub fn init() {
     disable_pic();
     // SAFETY: reading the APIC base MSR.
@@ -168,6 +201,18 @@ fn tsc_deadline_supported() -> bool {
     // CPUID.01H:ECX bit 24.
     let ecx = core::arch::x86_64::__cpuid(1).ecx;
     !cfg!(feature = "timer-oneshot") && ecx & (1 << 24) != 0
+}
+
+/// Per-CPU timer register setup for an already chosen kind.
+pub fn timer_init_ap() {
+    use crate::arch::idt::TIMER_VECTOR;
+    match timer_kind() {
+        TimerKind::TscDeadline => write(REG_LVT_TIMER, LVT_TSC_DEADLINE | u64::from(TIMER_VECTOR)),
+        TimerKind::OneShot { .. } => {
+            write(REG_TIMER_DIVIDE, 0b1011);
+            write(REG_LVT_TIMER, u64::from(TIMER_VECTOR));
+        }
+    }
 }
 
 pub fn timer_init() {

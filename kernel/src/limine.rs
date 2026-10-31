@@ -6,6 +6,7 @@
 //! specification and the reference crate source.
 
 use core::cell::UnsafeCell;
+use core::sync::atomic::AtomicU64;
 
 const COMMON_MAGIC: [u64; 2] = [0xc7b1dd30df4c8b88, 0x0a82e883a194f07b];
 const BASE_REVISION: u64 = 3;
@@ -102,6 +103,68 @@ impl MemmapResponse {
         unsafe { core::slice::from_raw_parts(self.entries, self.entry_count as usize) }
     }
 }
+
+/// Application processor description. Writing `goto_address` starts that CPU
+/// at the given function with `rdi` = this structure, interrupts off, on a
+/// bootloader stack; `extra_argument` is free for the kernel to use.
+#[repr(C)]
+pub struct MpInfo {
+    pub processor_id: u32,
+    pub lapic_id: u32,
+    _reserved: u64,
+    pub goto_address: AtomicU64,
+    pub extra_argument: AtomicU64,
+}
+
+#[repr(C)]
+pub struct MpResponse {
+    _revision: u64,
+    _flags: u32,
+    pub bsp_lapic_id: u32,
+    cpu_count: u64,
+    cpus: *const &'static MpInfo,
+}
+
+impl MpResponse {
+    pub fn cpus(&self) -> &'static [&'static MpInfo] {
+        // SAFETY: Limine provides `cpu_count` valid pointers.
+        unsafe { core::slice::from_raw_parts(self.cpus, self.cpu_count as usize) }
+    }
+}
+
+/// The MP request has one extra word (flags) after the response pointer.
+#[repr(C)]
+pub struct MpRequest {
+    magic: [u64; 2],
+    id: [u64; 2],
+    revision: u64,
+    response: UnsafeCell<*const MpResponse>,
+    flags: u64,
+}
+
+// SAFETY: the response pointer is written once by the bootloader before entry.
+unsafe impl Sync for MpRequest {}
+
+impl MpRequest {
+    const fn new() -> Self {
+        Self {
+            magic: COMMON_MAGIC,
+            id: [0x95a67b819a1b857e, 0xa0b61b723b6a73e0],
+            revision: 0,
+            response: UnsafeCell::new(core::ptr::null()),
+            flags: 0, // x2APIC is switched on by our own APIC code
+        }
+    }
+
+    pub fn response(&self) -> Option<&'static MpResponse> {
+        // SAFETY: as for `Request::response`.
+        unsafe { core::ptr::read_volatile(self.response.get()).as_ref() }
+    }
+}
+
+#[used]
+#[unsafe(link_section = ".limine_requests")]
+pub static MP: MpRequest = MpRequest::new();
 
 #[used]
 #[unsafe(link_section = ".limine_requests")]

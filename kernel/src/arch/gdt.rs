@@ -36,6 +36,8 @@ pub struct Selectors {
     // Consumed by the Phase 3 syscall/ring-3 entry code.
     #[allow(dead_code)]
     pub user_data: SegmentSelector,
+    // Consumed by the Phase 3 syscall/ring-3 entry code.
+    #[allow(dead_code)]
     pub user_code: SegmentSelector,
     tss: SegmentSelector,
 }
@@ -47,36 +49,29 @@ pub fn selectors() -> &'static Selectors {
     &GDT.get().expect("GDT not initialised").1
 }
 
-pub fn init() {
-    let tss = TSS.call_once(|| {
-        let mut tss = TaskStateSegment::new();
-        tss.interrupt_stack_table[usize::from(DOUBLE_FAULT_IST) - 1] =
-            stack_top(&DOUBLE_FAULT_STACK);
-        tss.interrupt_stack_table[usize::from(NMI_IST) - 1] = stack_top(&NMI_STACK);
-        tss
-    });
-    let (gdt, sel) = GDT.call_once(|| {
-        let mut gdt = GlobalDescriptorTable::new();
-        let kernel_code = gdt.append(Descriptor::kernel_code_segment());
-        let kernel_data = gdt.append(Descriptor::kernel_data_segment());
-        let user_data = gdt.append(Descriptor::user_data_segment());
-        let user_code = gdt.append(Descriptor::user_code_segment());
-        let tss_sel = gdt.append(Descriptor::tss_segment(tss));
-        (
-            gdt,
-            Selectors {
-                kernel_code,
-                kernel_data,
-                user_data,
-                user_code,
-                tss: tss_sel,
-            },
-        )
-    });
-    assert_eq!(sel.kernel_code.0, 0x08);
-    assert_eq!(sel.user_code.0, 0x23);
+fn build(tss: &'static TaskStateSegment) -> (GlobalDescriptorTable, Selectors) {
+    let mut gdt = GlobalDescriptorTable::new();
+    let kernel_code = gdt.append(Descriptor::kernel_code_segment());
+    let kernel_data = gdt.append(Descriptor::kernel_data_segment());
+    let user_data = gdt.append(Descriptor::user_data_segment());
+    let user_code = gdt.append(Descriptor::user_code_segment());
+    let tss_sel = gdt.append(Descriptor::tss_segment(tss));
+    assert_eq!(kernel_code.0, 0x08);
+    assert_eq!(user_code.0, 0x23);
+    (
+        gdt,
+        Selectors {
+            kernel_code,
+            kernel_data,
+            user_data,
+            user_code,
+            tss: tss_sel,
+        },
+    )
+}
 
-    // SAFETY: the GDT is 'static and its selectors match the descriptors above.
+fn load(gdt: &'static GlobalDescriptorTable, sel: &Selectors) {
+    // SAFETY: the GDT is 'static and its selectors match the descriptors in it.
     unsafe {
         gdt.load();
         CS::set_reg(sel.kernel_code);
@@ -85,5 +80,35 @@ pub fn init() {
         ES::set_reg(sel.kernel_data);
         load_tss(sel.tss);
     }
+}
+
+/// The boot CPU, before the heap exists: static tables and stacks.
+pub fn init() {
+    let tss = TSS.call_once(|| {
+        let mut tss = TaskStateSegment::new();
+        tss.interrupt_stack_table[usize::from(DOUBLE_FAULT_IST) - 1] =
+            stack_top(&DOUBLE_FAULT_STACK);
+        tss.interrupt_stack_table[usize::from(NMI_IST) - 1] = stack_top(&NMI_STACK);
+        tss
+    });
+    let (gdt, sel) = GDT.call_once(|| build(tss));
+    load(gdt, sel);
     kprintln!("[gdt] loaded; double-fault and NMI run on dedicated IST stacks");
+}
+
+fn leaked_stack_top() -> VirtAddr {
+    let stack = alloc::vec![0u8; IST_STACK_SIZE].leak();
+    VirtAddr::new((stack.as_ptr() as u64 + IST_STACK_SIZE as u64) & !15)
+}
+
+/// An application processor: each CPU needs its own TSS (the CPU marks it
+/// busy when loaded) and its own IST stacks.
+pub fn init_ap() {
+    let mut tss = TaskStateSegment::new();
+    tss.interrupt_stack_table[usize::from(DOUBLE_FAULT_IST) - 1] = leaked_stack_top();
+    tss.interrupt_stack_table[usize::from(NMI_IST) - 1] = leaked_stack_top();
+    let tss: &'static TaskStateSegment = alloc::boxed::Box::leak(alloc::boxed::Box::new(tss));
+    let (gdt, sel) = build(tss);
+    let gdt: &'static GlobalDescriptorTable = alloc::boxed::Box::leak(alloc::boxed::Box::new(gdt));
+    load(gdt, &sel);
 }

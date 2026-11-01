@@ -13,7 +13,8 @@ Rebuild from scratch; the design and phase plan live in the design doc
 | 1 Boot and memory | done (gate passed, see below) |
 | 2 Scheduler, timers, SMP | done in emulation (37/37 tests on 1, 2 and 4 CPUs). TSC-deadline and hardware latency numbers still need KVM/WHPX or real hardware |
 | 3 Userspace and syscalls | done in emulation (45/45 tests; ring-3 gate passed) |
-| 4 Storage and filesystems | next |
+| 3b FPU/SSE/AVX state saved on task switches | next (needed before the first real programs) |
+| 4 Storage and filesystems | after 3b |
 
 Phase 1 gate: *two address spaces stay isolated*. Proven by a hardware test
 (`ISOLATION` in the self-test): the same virtual address is mapped to different
@@ -103,8 +104,8 @@ Only one VM runs at a time (an OS file lock enforces it).
 - Ring 3 is tested only with the self-test programs (no shell/init yet; that
   comes with the filesystem). SYSRET returns without a canonical-address check
   (the kernel only ever stores canonical user RIPs). No FPU/SSE state is saved:
-  user programs must be built without SSE for now (XSAVE comes before general
-  programs). No KPTI (not needed on CPUs without Meltdown, such as recent
+  user programs must be built without SSE for now (scheduled as Phase 3b,
+  before Phase 4). No KPTI (not needed on CPUs without Meltdown, such as recent
   Intel). An NMI/machine check arriving in the few instructions between the
   final `swapgs` and `sysretq` would run with the wrong GS; NMIs are unused.
 - Task stacks are 64 KiB heap blocks with an overflow canary checked at every

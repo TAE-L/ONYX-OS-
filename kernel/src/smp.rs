@@ -42,9 +42,10 @@ unsafe extern "C" {
 extern "C" fn ap_main(info: &MpInfo, boot: &ApBoot) -> ! {
     cpu::init_quiet(true);
     paging::kernel().lock().activate();
-    gdt::init_ap();
+    let tss = gdt::init_ap();
     idt::load_on_this_cpu();
-    percpu::install(boot.index, info.lapic_id);
+    percpu::install(boot.index, info.lapic_id, tss);
+    crate::syscall::init_cpu();
     apic::init_ap();
     apic::timer_init_ap();
     kprintln!(

@@ -179,6 +179,23 @@ const EXCEPTION_NAMES: [&str; 32] = [
 
 #[unsafe(no_mangle)]
 extern "C" fn isr_dispatch(frame: &mut TrapFrame) {
+    let from_user = frame.cs & 3 == 3;
+    if from_user && frame.vector < 32 {
+        // A fault in ring 3 ends that process, never the kernel.
+        let addr = if frame.vector == 14 {
+            Cr2::read_raw()
+        } else {
+            0
+        };
+        crate::process::user_fault(frame, addr);
+    }
+    dispatch_kernel_event(frame);
+    if from_user {
+        crate::process::check_kill();
+    }
+}
+
+fn dispatch_kernel_event(frame: &mut TrapFrame) {
     match frame.vector as u8 {
         3 => {
             BREAKPOINTS.fetch_add(1, SeqCst);
@@ -213,6 +230,11 @@ fn page_fault(frame: &mut TrapFrame) {
     if frame.rip == site {
         PROBE_FAULTS.fetch_add(1, SeqCst);
         frame.rip = recover;
+        return;
+    }
+    if frame.rip == &raw const probe_write_u8_site as u64 {
+        PROBE_FAULTS.fetch_add(1, SeqCst);
+        frame.rip = &raw const probe_write_u8_recover as u64;
         return;
     }
     fatal(frame)
@@ -308,13 +330,51 @@ probe_read_u8_recover:
 4:
     mov eax, 1
     ret
+
+    .global probe_write_u8
+    .global probe_write_u8_site
+    .global probe_write_u8_recover
+    .hidden probe_write_u8
+    .hidden probe_write_u8_site
+    .hidden probe_write_u8_recover
+// probe_write_u8(addr [rdi], value [sil], use_stac [edx]) -> 0 ok, 1 faulted
+probe_write_u8:
+    test edx, edx
+    jz 5f
+    stac
+5:
+probe_write_u8_site:
+    mov byte ptr [rdi], sil
+    test edx, edx
+    jz 6f
+    clac
+6:
+    xor eax, eax
+    ret
+probe_write_u8_recover:
+    test edx, edx
+    jz 7f
+    clac
+7:
+    mov eax, 1
+    ret
 "#
 );
 
 unsafe extern "C" {
     fn probe_read_u8(addr: u64, out: *mut u8, use_stac: u32) -> u32;
+    fn probe_write_u8(addr: u64, value: u8, use_stac: u32) -> u32;
+    static probe_write_u8_site: u8;
+    static probe_write_u8_recover: u8;
     static probe_read_u8_site: u8;
     static probe_read_u8_recover: u8;
+}
+
+/// Write one byte at `addr` in the *current* address space; false if it faults.
+pub fn try_write_u8(addr: u64, value: u8) -> bool {
+    let use_stac = u32::from(crate::arch::cpu::smap_enabled());
+    // SAFETY: the asm only writes one byte and recovers from a page fault.
+    unsafe { probe_write_u8(addr, value, use_stac) == 0 }
 }
 
 /// Read one byte at `addr` in the *current* address space, or `None` if the

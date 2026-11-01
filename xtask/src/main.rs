@@ -132,7 +132,36 @@ fn run_checked(mut c: Command) -> Res<()> {
     }
 }
 
+/// The ring-3 test programs, built as static ELFs into `target/user/`. The
+/// kernel's self-test embeds them with `include_bytes!`.
+fn build_user() -> Res<()> {
+    let mut c = Command::new(env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
+    c.current_dir(root()).env("RUSTC_BOOTSTRAP", "1").args([
+        "build",
+        "-p",
+        "userland",
+        "--release",
+        "--target",
+        TARGET,
+        "-Zbuild-std=core",
+        "-Zbuild-std-features=compiler-builtins-mem",
+    ]);
+    run_checked(c)?;
+    let out = root().join("target").join("user");
+    fs::create_dir_all(&out).map_err(|e| e.to_string())?;
+    let built = root().join("target").join(TARGET).join("release");
+    for name in ["hello", "faults", "spin", "iso", "badptr", "sysc"] {
+        let from = built.join(name);
+        fs::copy(&from, out.join(format!("{name}.elf")))
+            .map_err(|e| format!("copy {}: {e}", from.display()))?;
+    }
+    Ok(())
+}
+
 fn build(o: &Opts, selftest: bool) -> Res<PathBuf> {
+    if selftest {
+        build_user()?;
+    }
     let mut c = cargo("build", o.release);
     if selftest {
         c.args(["--features", "selftest"]);
@@ -391,6 +420,7 @@ fn check() -> Res<()> {
     fmt.current_dir(root())
         .args(["fmt", "--all", "--", "--check"]);
     run_checked(fmt)?;
+    build_user()?;
     let mut clippy = cargo("clippy", false);
     clippy.args(["--features", "selftest", "--", "-D", "warnings"]);
     run_checked(clippy)?;

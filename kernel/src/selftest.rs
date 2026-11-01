@@ -180,6 +180,38 @@ static TESTS: &[Test] = &[
         name: "smp: heap and IrqMutex stay consistent under all-CPU contention",
         run: smp_lock_stress,
     },
+    Test {
+        name: "proc: a static ELF runs in ring 3, writes through a syscall and exits",
+        run: proc_hello,
+    },
+    Test {
+        name: "proc: syscalls behave, registers survive, bad user pointers are refused",
+        run: proc_syscalls,
+    },
+    Test {
+        name: "RING 3 GATE: 18 forbidden operations each end only the offender",
+        run: proc_faults,
+    },
+    Test {
+        name: "proc: a ring-3 spinner is preempted and can be killed (every CPU)",
+        run: proc_kill,
+    },
+    Test {
+        name: "proc: same virtual address, separate data across live processes",
+        run: proc_isolation,
+    },
+    Test {
+        name: "proc: eight processes at once, all CPUs, correct results",
+        run: proc_parallel,
+    },
+    Test {
+        name: "elf: malformed and hostile images are rejected without leaking",
+        run: elf_rejects,
+    },
+    Test {
+        name: "proc: 60 process lifecycles (half of them faulting) leak nothing",
+        run: proc_no_leak,
+    },
 ];
 
 pub fn run() -> ! {
@@ -1209,5 +1241,416 @@ fn smp_lock_stress() -> TestResult {
         mm::heap::used() <= heap0 + 8192,
         "heap leaked during the stress run"
     );
+    Ok(())
+}
+
+// --- ring 3 --------------------------------------------------------------------------
+
+use crate::elf::{self, ElfError};
+use crate::process::{self, ExitStatus, SpawnError as ProcSpawnError};
+use alloc::sync::Arc;
+
+static HELLO: &[u8] = include_bytes!("../../target/user/hello.elf");
+static FAULTS: &[u8] = include_bytes!("../../target/user/faults.elf");
+static SPIN: &[u8] = include_bytes!("../../target/user/spin.elf");
+static ISO: &[u8] = include_bytes!("../../target/user/iso.elf");
+static BADPTR: &[u8] = include_bytes!("../../target/user/badptr.elf");
+static SYSC: &[u8] = include_bytes!("../../target/user/sysc.elf");
+
+fn run_user(
+    name: &'static str,
+    image: &[u8],
+    arg: u64,
+    pin: Option<usize>,
+) -> Result<(Arc<process::Process>, ExitStatus), &'static str> {
+    let p = process::spawn_elf(name, image, arg, pin).map_err(|_| "spawn failed")?;
+    let Some(status) = process::wait(&p, 10_000) else {
+        p.kill();
+        return Err("process did not finish in 10 s");
+    };
+    Ok((p, status))
+}
+
+/// Everything the kernel needs to keep working must still be in place.
+fn kernel_is_sane() -> TestResult {
+    ensure!(
+        x86_64::instructions::interrupts::are_enabled(),
+        "interrupts left disabled"
+    );
+    ensure!(
+        cpu_index() < sched::MAX_CPUS && sched::is_online(cpu_index()),
+        "per-CPU data (GS base) is not the kernel's"
+    );
+    Ok(())
+}
+
+fn proc_hello() -> TestResult {
+    let (p, status) = run_user("hello", HELLO, 0, None)?;
+    ensure!(status == ExitStatus::Exited(7), "wrong exit status");
+    ensure!(p.stdout() == b"hello from ring 3\n", "wrong output");
+    kernel_is_sane()
+}
+
+fn proc_syscalls() -> TestResult {
+    let (_, status) = run_user("sysc", SYSC, 0, None)?;
+    if status != ExitStatus::Exited(0) {
+        kprintln!("       sysc status {status:?} (bit n = check n failed)");
+        return Err("syscall behaviour or register preservation wrong");
+    }
+    // A real, mapped, writable kernel address the program must not be able to use.
+    let secret: Box<[u8; 64]> = Box::new([0x5A; 64]);
+    let (p, status) = run_user("badptr", BADPTR, secret.as_ptr() as u64, None)?;
+    ensure!(
+        secret.iter().all(|&b| b == 0x5A),
+        "a syscall wrote kernel memory for a user"
+    );
+    ensure!(
+        status == ExitStatus::Exited(0),
+        "a bad pointer was accepted, or a good one refused"
+    );
+    ensure!(p.stdout() == b"read-only bytes!", "valid write lost");
+    kernel_is_sane()
+}
+
+/// (mode, expected vector, what the CPU should report in error/addr)
+fn proc_faults() -> TestResult {
+    const KERNEL: u64 = 0xffff_8000_0000_1000;
+    struct Case {
+        mode: u64,
+        vector: u64,
+        what: &'static str,
+        check: fn(error: u64, addr: u64) -> bool,
+    }
+    let cases = [
+        Case {
+            mode: 0,
+            vector: 14,
+            what: "null read",
+            check: |e, a| a == 0 && e & 0b101 == 0b100,
+        },
+        Case {
+            mode: 1,
+            vector: 14,
+            what: "kernel read",
+            check: |e, a| a == KERNEL && e & 0b101 == 0b101,
+        },
+        Case {
+            mode: 2,
+            vector: 14,
+            what: "jump into the kernel",
+            check: |e, _| e & 0b10100 == 0b10100,
+        },
+        Case {
+            mode: 3,
+            vector: 14,
+            what: "write own code",
+            check: |e, _| e & 0b111 == 0b111,
+        },
+        Case {
+            mode: 4,
+            vector: 13,
+            what: "cli",
+            check: |_, _| true,
+        },
+        Case {
+            mode: 5,
+            vector: 13,
+            what: "hlt",
+            check: |_, _| true,
+        },
+        Case {
+            mode: 6,
+            vector: 13,
+            what: "in (port I/O)",
+            check: |_, _| true,
+        },
+        Case {
+            mode: 7,
+            vector: 13,
+            what: "int 0x30",
+            check: |e, _| e == (0x30 << 3) | 2,
+        },
+        Case {
+            mode: 8,
+            vector: 6,
+            what: "ud2",
+            check: |_, _| true,
+        },
+        Case {
+            mode: 9,
+            vector: 0,
+            what: "divide by zero",
+            check: |_, _| true,
+        },
+        Case {
+            mode: 10,
+            vector: 14,
+            what: "kernel write",
+            check: |e, a| a == KERNEL && e & 0b111 == 0b111,
+        },
+        Case {
+            mode: 11,
+            vector: 13,
+            what: "wrmsr",
+            check: |_, _| true,
+        },
+        Case {
+            mode: 12,
+            vector: 13,
+            what: "read cr3",
+            check: |_, _| true,
+        },
+        Case {
+            mode: 13,
+            vector: 14,
+            what: "execute the stack (NX)",
+            check: |e, _| e & 0b10100 == 0b10100,
+        },
+        Case {
+            mode: 15,
+            vector: 14,
+            what: "stack overflow",
+            check: |e, a| {
+                let floor = elf::STACK_TOP - elf::STACK_PAGES * mm::PAGE_SIZE;
+                e & 0b100 != 0 && a < floor && a + 4096 >= floor
+            },
+        },
+        Case {
+            mode: 16,
+            vector: 13,
+            what: "sti",
+            check: |_, _| true,
+        },
+        Case {
+            mode: 17,
+            vector: 13,
+            what: "lgdt",
+            check: |_, _| true,
+        },
+        Case {
+            mode: 18,
+            vector: 13,
+            what: "out (port I/O)",
+            check: |_, _| true,
+        },
+    ];
+    let cpus = online_list();
+    for (i, c) in cases.iter().enumerate() {
+        // Spread the offenders over the CPUs so every CPU takes ring-3 faults.
+        let pin = cpus[i % cpus.len()];
+        let (_, status) = run_user("faults", FAULTS, c.mode, Some(pin))?;
+        match status {
+            ExitStatus::Faulted {
+                vector,
+                error,
+                addr,
+                ..
+            } => {
+                if vector != c.vector {
+                    kprintln!(
+                        "       {}: got vector {vector}, wanted {}",
+                        c.what,
+                        c.vector
+                    );
+                    return Err("wrong exception for a forbidden operation");
+                }
+                if !(c.check)(error, addr) {
+                    kprintln!("       {}: error={error:#x} addr={addr:#x}", c.what);
+                    return Err("exception details are wrong");
+                }
+            }
+            _ => {
+                kprintln!("       {}: status {status:?}", c.what);
+                return Err("a forbidden operation did not fault");
+            }
+        }
+        kernel_is_sane()?;
+    }
+    // The control case must not fault: an unknown syscall returns ENOSYS.
+    let (_, status) = run_user("faults", FAULTS, 14, None)?;
+    ensure!(
+        status == ExitStatus::Exited(0),
+        "unknown syscall faulted or misreported"
+    );
+    // The kernel still schedules, allocates and runs new processes.
+    let (_, status) = run_user("hello", HELLO, 0, None)?;
+    ensure!(
+        status == ExitStatus::Exited(7),
+        "kernel unusable after the faults"
+    );
+    kernel_is_sane()
+}
+
+fn proc_kill() -> TestResult {
+    for cpu in online_list() {
+        let p = process::spawn_elf("spin", SPIN, 0, Some(cpu)).map_err(|_| "spawn failed")?;
+        sched::sleep_ns(30_000_000);
+        ensure!(p.status().is_none(), "spinner ended on its own");
+        p.kill();
+        let status = process::wait(&p, 2000).ok_or("kill did not stop a ring-3 spinner")?;
+        ensure!(status == ExitStatus::Killed, "wrong status after kill");
+    }
+    kernel_is_sane()
+}
+
+fn proc_isolation() -> TestResult {
+    let mut procs = Vec::new();
+    for i in 0..4u64 {
+        // Two pinned to one CPU so they interleave, two free to move.
+        let pin = if i < 2 { Some(0) } else { None };
+        procs.push(
+            process::spawn_elf("iso", ISO, 0x1111_0000 + i, pin).map_err(|_| "spawn failed")?,
+        );
+    }
+    for p in &procs {
+        let status = process::wait(p, 10_000).ok_or("no result")?;
+        ensure!(
+            status == ExitStatus::Exited(0),
+            "a process saw another one's data"
+        );
+        ensure!(p.stdout() == b"isolated\n", "wrong output");
+    }
+    let cr3s: Vec<u64> = procs.iter().map(|p| p.cr3()).collect();
+    ensure!(
+        (0..cr3s.len()).all(|i| (0..i).all(|j| cr3s[i] != cr3s[j])),
+        "two processes share a page-table root"
+    );
+    Ok(())
+}
+
+fn proc_parallel() -> TestResult {
+    let mut procs = Vec::new();
+    for _ in 0..8 {
+        procs.push(process::spawn_elf("hello", HELLO, 0, None).map_err(|_| "spawn failed")?);
+    }
+    for p in &procs {
+        let status = process::wait(p, 10_000).ok_or("no result")?;
+        ensure!(status == ExitStatus::Exited(7), "wrong status");
+        ensure!(p.stdout() == b"hello from ring 3\n", "wrong output");
+    }
+    kernel_is_sane()
+}
+
+fn patch(image: &[u8], f: impl FnOnce(&mut Vec<u8>)) -> Vec<u8> {
+    let mut v = image.to_vec();
+    f(&mut v);
+    v
+}
+
+fn put64(v: &mut [u8], at: usize, x: u64) {
+    v[at..at + 8].copy_from_slice(&x.to_le_bytes());
+}
+fn put32(v: &mut [u8], at: usize, x: u32) {
+    v[at..at + 4].copy_from_slice(&x.to_le_bytes());
+}
+fn get64(v: &[u8], at: usize) -> u64 {
+    u64::from_le_bytes(v[at..at + 8].try_into().unwrap())
+}
+
+/// Wait until every earlier process has been fully torn down, so frame
+/// counts can be compared before and after.
+fn settle() {
+    let mut waited = 0;
+    while process::live_processes() != 0 && waited < 2000 {
+        sched::sleep_ns(1_000_000);
+        waited += 1;
+    }
+    sched::sleep_ns(3_000_000);
+}
+
+fn elf_rejects() -> TestResult {
+    settle();
+    let phoff = get64(HELLO, 32) as usize;
+    let ph = |i: usize| phoff + i * 56;
+    let before = frame::free_frames();
+    let cases: Vec<(&str, Vec<u8>)> = alloc::vec![
+        ("truncated", HELLO[..40].to_vec()),
+        ("bad magic", patch(HELLO, |v| v[0] = 0)),
+        ("shared object", patch(HELLO, |v| v[16] = 3)),
+        ("wrong machine", patch(HELLO, |v| v[18] = 3)),
+        ("32-bit", patch(HELLO, |v| v[4] = 1)),
+        (
+            "writable+executable",
+            patch(HELLO, |v| put32(v, ph(0) + 4, 7))
+        ),
+        (
+            "into the kernel half",
+            patch(HELLO, |v| put64(v, ph(0) + 16, 0xffff_8000_0000_0000))
+        ),
+        (
+            "below the null guard",
+            patch(HELLO, |v| put64(v, ph(0) + 16, 0x1000))
+        ),
+        (
+            "file larger than memory",
+            patch(HELLO, |v| put64(v, ph(0) + 32, 1 << 40))
+        ),
+        (
+            "file range outside image",
+            patch(HELLO, |v| put64(v, ph(0) + 8, 1 << 40))
+        ),
+        (
+            "entry outside code",
+            patch(HELLO, |v| put64(v, 24, 0x1_0000))
+        ),
+        (
+            "overlapping segments",
+            patch(HELLO, |v| {
+                let a = get64(v, ph(0) + 16);
+                put64(v, ph(1) + 16, a);
+            })
+        ),
+        (
+            "address overflow",
+            patch(HELLO, |v| put64(v, ph(0) + 40, u64::MAX))
+        ),
+        ("dynamic interpreter", patch(HELLO, |v| put32(v, ph(0), 3))),
+        ("no program headers", patch(HELLO, |v| v[56] = 0)),
+    ];
+    for (name, image) in &cases {
+        match process::spawn_elf("bad", image, 0, None) {
+            Err(ProcSpawnError::Elf(e)) => {
+                if matches!(e, ElfError::OutOfMemory) {
+                    return Err("out of memory instead of a rejection");
+                }
+            }
+            Err(_) => return Err("rejected for the wrong reason"),
+            Ok(p) => {
+                p.kill();
+                kprintln!("       accepted: {name}");
+                return Err("a hostile ELF was accepted");
+            }
+        }
+    }
+    ensure!(
+        frame::free_frames() == before,
+        "rejected images leaked frames"
+    );
+    Ok(())
+}
+
+fn proc_no_leak() -> TestResult {
+    settle();
+    let frames0 = frame::free_frames();
+    let heap0 = mm::heap::used();
+    let tasks0 = sched::task_count();
+    for i in 0..60u64 {
+        let (_, status) = if i % 2 == 0 {
+            run_user("hello", HELLO, 0, None)?
+        } else {
+            run_user("faults", FAULTS, 0, None)?
+        };
+        let _ = status;
+    }
+    sched::sleep_ns(10_000_000);
+    let mut waited = 0;
+    while process::live_processes() != 0 && waited < 1000 {
+        sched::sleep_ns(1_000_000);
+        waited += 1;
+    }
+    ensure!(process::live_processes() == 0, "processes still alive");
+    ensure!(sched::task_count() == tasks0, "tasks not reaped");
+    ensure!(frame::free_frames() == frames0, "physical frames leaked");
+    ensure!(mm::heap::used() <= heap0 + 8192, "kernel heap leaked");
     Ok(())
 }

@@ -12,7 +12,8 @@ Rebuild from scratch; the design and phase plan live in the design doc
 | 0 Tooling and harness | done |
 | 1 Boot and memory | done (gate passed, see below) |
 | 2 Scheduler, timers, SMP | done in emulation (37/37 tests on 1, 2 and 4 CPUs). TSC-deadline and hardware latency numbers still need KVM/WHPX or real hardware |
-| 3 Userspace and syscalls | next |
+| 3 Userspace and syscalls | done in emulation (45/45 tests; ring-3 gate passed) |
+| 4 Storage and filesystems | next |
 
 Phase 1 gate: *two address spaces stay isolated*. Proven by a hardware test
 (`ISOLATION` in the self-test): the same virtual address is mapped to different
@@ -28,6 +29,19 @@ reschedule IPIs wake idle CPUs; an idle CPU steals from a loaded one, a loaded
 CPU pushes to a clearly emptier one; tasks can be pinned to a CPU.
 Gate: *wake-latency p99 is measured*; in the self-test a 300 us-slice sleeper
 preempting a busy task shows p99 well under the busy task's 3 ms slice.
+
+Phase 3: ring 3 via SYSCALL/SYSRET and interrupt gates, per-task kernel stacks
+(TSS rsp0, `swapgs` on every entry from user mode), a strict static-ELF loader
+(no W+X, no overlap, nothing in the kernel half, validated before any mapping),
+processes with their own address space whose frames are freed on exit, a native
+syscall table (exit, write, yield, sleep, getpid, clock) and validated,
+fault-tolerant user-memory copies (SMAP-aware).
+Gate: *a ring-3 fault cannot crash the kernel*. 18 forbidden operations (null and
+kernel pointers, jumping into the kernel, writing own code, executing the stack,
+stack overflow, cli/sti/hlt, port I/O, wrmsr, reading CR3, lgdt, `int 0x30`, ud2,
+divide by zero) each end only the offending process, with the right exception
+and error code, on every CPU, and the kernel keeps scheduling and allocating.
+User test programs are Rust `no_std` ELFs in `user/`, built by `cargo xtask`.
 
 ## Use
 
@@ -86,6 +100,13 @@ Only one VM runs at a time (an OS file lock enforces it).
   can be forced with `--features timer-oneshot`.
 - Wake-latency numbers from the self-test come from software emulation and are
   not hardware results.
+- Ring 3 is tested only with the self-test programs (no shell/init yet; that
+  comes with the filesystem). SYSRET returns without a canonical-address check
+  (the kernel only ever stores canonical user RIPs). No FPU/SSE state is saved:
+  user programs must be built without SSE for now (XSAVE comes before general
+  programs). No KPTI (not needed on CPUs without Meltdown, such as recent
+  Intel). An NMI/machine check arriving in the few instructions between the
+  final `swapgs` and `sysretq` would run with the wrong GS; NMIs are unused.
 - Task stacks are 64 KiB heap blocks with an overflow canary checked at every
   switch, not guard pages. No FPU/SSE state is saved yet (the kernel target uses
   none); Phase 3 adds XSAVE for user tasks.

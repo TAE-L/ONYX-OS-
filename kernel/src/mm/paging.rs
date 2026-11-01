@@ -90,6 +90,12 @@ pub mod flags {
             .union(F::NO_CACHE)
             .union(F::WRITE_THROUGH)
     }
+    pub const fn user_rx() -> F {
+        F::PRESENT.union(F::USER_ACCESSIBLE)
+    }
+    pub const fn user_ro() -> F {
+        F::PRESENT.union(F::NO_EXECUTE).union(F::USER_ACCESSIBLE)
+    }
     pub const fn user_rw() -> F {
         F::PRESENT
             .union(F::WRITABLE)
@@ -118,6 +124,8 @@ unsafe fn table(phys: u64) -> &'static mut PageTable {
 pub struct AddressSpace {
     root: u64,
     owns_user_tables: bool,
+    /// Also free the 4 KiB frames mapped in the user half (process spaces).
+    owns_user_frames: bool,
 }
 
 impl AddressSpace {
@@ -125,6 +133,7 @@ impl AddressSpace {
         Some(Self {
             root: frame::alloc_zeroed()?,
             owns_user_tables: false,
+            owns_user_frames: false,
         })
     }
 
@@ -142,6 +151,27 @@ impl AddressSpace {
             }
         }
         Some(space)
+    }
+
+    /// A user address space whose mapped frames belong to it: they are freed on drop.
+    pub fn new_process() -> Option<Self> {
+        let mut space = Self::new_user()?;
+        space.owns_user_frames = true;
+        Some(space)
+    }
+
+    /// Allocate a zeroed frame, map it at `va` and return its physical address.
+    pub fn map_new(&mut self, va: u64, flags: F) -> Result<u64, MapError> {
+        let pa = frame::alloc_zeroed().ok_or(MapError::OutOfMemory)?;
+        if let Err(e) = self.map(va, pa, PageSize::Size4K, flags) {
+            frame::free_frame(pa);
+            return Err(e);
+        }
+        Ok(pa)
+    }
+
+    pub fn root_phys(&self) -> u64 {
+        self.root
     }
 
     pub fn is_active(&self) -> bool {
@@ -343,24 +373,36 @@ impl Drop for AddressSpace {
         if !self.owns_user_tables {
             return;
         }
-        fn free_tables(tbl: u64, level: usize) {
+        fn free_tables(tbl: u64, level: usize, free_leaves: bool) {
             // SAFETY: tbl is a table frame owned by the dropping space.
             let t = unsafe { table(tbl) };
             if level > 0 {
                 let limit = if level == 3 { 256 } else { 512 };
                 for entry in t.iter().take(limit) {
-                    if !entry.is_unused() && !entry.flags().contains(F::HUGE_PAGE) {
-                        free_tables(entry.addr().as_u64(), level - 1);
+                    if entry.is_unused() {
+                        continue;
                     }
+                    if !entry.flags().contains(F::HUGE_PAGE) {
+                        free_tables(entry.addr().as_u64(), level - 1, free_leaves);
+                    }
+                }
+            } else if free_leaves {
+                for entry in t.iter().filter(|e| !e.is_unused()) {
+                    frame::free_frame(entry.addr().as_u64());
                 }
             }
             frame::free_frame(tbl);
         }
-        free_tables(self.root, 3);
+        free_tables(self.root, 3, self.owns_user_frames);
     }
 }
 
 static KERNEL: Once<Mutex<AddressSpace>> = Once::new();
+
+/// Physical address of the kernel's root page table.
+pub fn kernel_root() -> u64 {
+    kernel().lock().root
+}
 
 pub fn kernel() -> &'static Mutex<AddressSpace> {
     KERNEL.get().expect("kernel address space not initialised")

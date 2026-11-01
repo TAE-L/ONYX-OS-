@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["kernel", "xtask"]
+members = ["kernel", "user", "xtask"]
 # `cargo build` at the root must not try to build the kernel for the host.
 default-members = ["xtask"]
 

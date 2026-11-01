@@ -42,7 +42,14 @@ pub struct Selectors {
     tss: SegmentSelector,
 }
 
-static TSS: Once<TaskStateSegment> = Once::new();
+/// The CPU reads the TSS through the GDT while this CPU's scheduler updates
+/// `rsp0` in it, so it lives in an `UnsafeCell`.
+struct TssCell(UnsafeCell<TaskStateSegment>);
+
+// SAFETY: only the owning CPU writes it, with interrupts off.
+unsafe impl Sync for TssCell {}
+
+static BSP_TSS: TssCell = TssCell(UnsafeCell::new(TaskStateSegment::new()));
 static GDT: Once<(GlobalDescriptorTable, Selectors)> = Once::new();
 
 pub fn selectors() -> &'static Selectors {
@@ -82,15 +89,21 @@ fn load(gdt: &'static GlobalDescriptorTable, sel: &Selectors) {
     }
 }
 
+/// The boot CPU's TSS, for its per-CPU block (valid after `init`).
+pub fn bsp_tss() -> *mut TaskStateSegment {
+    // The CPU reads it through the GDT; only this CPU's scheduler writes `rsp0`.
+    BSP_TSS.0.get()
+}
+
 /// The boot CPU, before the heap exists: static tables and stacks.
 pub fn init() {
-    let tss = TSS.call_once(|| {
-        let mut tss = TaskStateSegment::new();
-        tss.interrupt_stack_table[usize::from(DOUBLE_FAULT_IST) - 1] =
-            stack_top(&DOUBLE_FAULT_STACK);
-        tss.interrupt_stack_table[usize::from(NMI_IST) - 1] = stack_top(&NMI_STACK);
-        tss
-    });
+    // SAFETY: boot CPU, single-threaded, before the TSS is loaded.
+    let tss: &'static TaskStateSegment = unsafe {
+        let t = &mut *BSP_TSS.0.get();
+        t.interrupt_stack_table[usize::from(DOUBLE_FAULT_IST) - 1] = stack_top(&DOUBLE_FAULT_STACK);
+        t.interrupt_stack_table[usize::from(NMI_IST) - 1] = stack_top(&NMI_STACK);
+        &*BSP_TSS.0.get()
+    };
     let (gdt, sel) = GDT.call_once(|| build(tss));
     load(gdt, sel);
     kprintln!("[gdt] loaded; double-fault and NMI run on dedicated IST stacks");
@@ -103,12 +116,15 @@ fn leaked_stack_top() -> VirtAddr {
 
 /// An application processor: each CPU needs its own TSS (the CPU marks it
 /// busy when loaded) and its own IST stacks.
-pub fn init_ap() {
+/// Returns this CPU's TSS so the caller can record it in the per-CPU block.
+pub fn init_ap() -> *mut TaskStateSegment {
     let mut tss = TaskStateSegment::new();
     tss.interrupt_stack_table[usize::from(DOUBLE_FAULT_IST) - 1] = leaked_stack_top();
     tss.interrupt_stack_table[usize::from(NMI_IST) - 1] = leaked_stack_top();
-    let tss: &'static TaskStateSegment = alloc::boxed::Box::leak(alloc::boxed::Box::new(tss));
-    let (gdt, sel) = build(tss);
+    let raw = alloc::boxed::Box::into_raw(alloc::boxed::Box::new(tss));
+    // SAFETY: just leaked; lives forever.
+    let (gdt, sel) = build(unsafe { &*raw });
     let gdt: &'static GlobalDescriptorTable = alloc::boxed::Box::leak(alloc::boxed::Box::new(gdt));
     load(gdt, &sel);
+    raw
 }

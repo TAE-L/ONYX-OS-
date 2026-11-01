@@ -1,0 +1,7 @@
+[package]
+name = "userland"
+version = "0.1.0"
+edition = "2024"
+publish = false
+build = "build.rs"
+description = "Test programs that run in ring 3 under OnyxOS (static ELF, no libc)"

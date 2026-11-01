@@ -16,11 +16,13 @@ extern crate alloc;
 mod log;
 mod arch;
 mod boot;
+mod elf;
 mod limine;
 mod mm;
 mod panic;
 mod percpu;
 mod perf;
+mod process;
 #[cfg(feature = "selftest")]
 mod qemu;
 mod sched;
@@ -29,6 +31,7 @@ mod selftest;
 mod serial;
 mod smp;
 mod sync;
+mod syscall;
 
 pub const NAME: &str = "OnyxOS";
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -69,7 +72,8 @@ extern "C" fn kmain() -> ! {
     arch::apic::init();
     arch::time::init();
     arch::apic::timer_init();
-    percpu::install(0, arch::apic::id());
+    percpu::install(0, arch::apic::id(), arch::gdt::bsp_tss());
+    syscall::init_cpu();
     sched::init(arch::apic::id());
     smp::start_aps();
     x86_64::instructions::interrupts::enable();

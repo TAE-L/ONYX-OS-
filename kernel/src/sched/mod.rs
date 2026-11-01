@@ -18,15 +18,20 @@
 //! kernel stack; the task resumes exactly there when picked again.
 
 use crate::arch::{apic, idt, time};
-use crate::percpu::cpu_index;
+use crate::mm::paging;
+use crate::percpu::{self, cpu_index};
 use crate::perf::{Histogram, rdtsc};
+use crate::process::Process;
 use crate::sync::IrqMutex;
 use alloc::{boxed::Box, collections::BTreeMap, collections::BTreeSet, sync::Arc, vec};
 use core::sync::atomic::{
     AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize,
     Ordering::{Acquire, Relaxed, Release},
 };
+use x86_64::PhysAddr;
 use x86_64::instructions::interrupts;
+use x86_64::registers::control::{Cr3, Cr3Flags};
+use x86_64::structures::paging::PhysFrame;
 
 pub type TaskId = u64;
 pub const MAX_CPUS: usize = 16;
@@ -98,6 +103,20 @@ struct Task {
     /// until the CPU that switched to something else has fully saved its
     /// registers. Other CPUs must not steal it in that window.
     switching: AtomicBool,
+    /// The user process this task is the main thread of, if any.
+    process: Option<Arc<Process>>,
+    /// Page-table root to run under; 0 = the kernel's own.
+    cr3: u64,
+    /// Top of this task's kernel stack, where interrupts from ring 3 land.
+    kstack_top: u64,
+}
+
+/// Everything `schedule` needs to carry out a decision.
+struct Switch {
+    old_slot: *mut u64,
+    new_rsp: u64,
+    cr3: u64,
+    kstack: u64,
 }
 
 /// Task numbers other CPUs and tests may read without touching a run queue.
@@ -144,6 +163,8 @@ struct CpuSlot {
     lapic_id: AtomicU32,
     /// `switching` flag of the task this CPU just switched away from.
     prev_switch: AtomicPtr<AtomicBool>,
+    /// The task this CPU just left is a zombie: free it once the switch is done.
+    reap_pending: AtomicBool,
 }
 
 impl CpuSlot {
@@ -156,6 +177,7 @@ impl CpuSlot {
             dl_ppm: AtomicU64::new(0),
             lapic_id: AtomicU32::new(0),
             prev_switch: AtomicPtr::new(core::ptr::null_mut()),
+            reap_pending: AtomicBool::new(false),
         }
     }
 }
@@ -442,7 +464,7 @@ impl Rq {
 
     /// Choose the next task and return the pointers for `switch_context`,
     /// or `None` if the current task stays.
-    fn reschedule(&mut self) -> Option<(*mut u64, u64)> {
+    fn reschedule(&mut self) -> Option<Switch> {
         let now_tsc = rdtsc();
         self.account(now_tsc);
         let now_ns = time::now_ns();
@@ -474,25 +496,33 @@ impl Rq {
             return None;
         }
         self.task(old).stats.since_tsc.store(0, Relaxed);
-        let new_rsp = {
+        let (new_rsp, cr3, kstack) = {
             let n = self.task(next);
             n.state = State::Running;
             n.stats.since_tsc.store(now_tsc, Relaxed);
             if let Some(target) = n.wake_target.take() {
                 WAKE_LATENCY.record(time::tsc_to_ns(rdtsc().saturating_sub(target)));
             }
-            n.rsp
+            (n.rsp, n.cr3, n.kstack_top)
         };
         self.current = next;
         SWITCHES.fetch_add(1, Relaxed);
         let cpu = self.cpu;
         let old_task = self.task(old);
+        if old_task.state == State::Zombie {
+            CPUS[cpu].reap_pending.store(true, Relaxed);
+        }
         old_task.switching.store(true, Release);
         let flag: *const AtomicBool = &old_task.switching;
         CPUS[cpu].prev_switch.store(flag.cast_mut(), Release);
         let old_slot: *mut u64 = &mut old_task.rsp;
         self.publish();
-        Some((old_slot, new_rsp))
+        Some(Switch {
+            old_slot,
+            new_rsp,
+            cr3,
+            kstack,
+        })
     }
 
     /// `rearm` evaluated as if `next` were already current.
@@ -544,10 +574,19 @@ fn with_rq<R>(cpu: usize, f: impl FnOnce(&mut Rq) -> R) -> R {
 /// Mark the switch away from the previous task as complete, on the CPU that
 /// just resumed. Until then other CPUs must not touch that task.
 fn finish_switch() {
-    let flag = slot().prev_switch.swap(core::ptr::null_mut(), Acquire);
+    let s = slot();
+    let flag = s.prev_switch.swap(core::ptr::null_mut(), Acquire);
     if !flag.is_null() {
         // SAFETY: points into a `Box<Task>` that is not freed before this store.
         unsafe { (*flag).store(false, Release) };
+    }
+    // A task that exited is no longer on any stack: release it (and, for a
+    // process, its memory) now instead of at some later reschedule.
+    if s.reap_pending.swap(false, Relaxed) {
+        let mut guard = s.rq.lock();
+        if let Some(rq) = guard.as_mut() {
+            rq.reap();
+        }
     }
 }
 
@@ -635,10 +674,26 @@ fn schedule(pre: impl FnOnce(&mut Rq)) {
             .expect("run queue not initialised")
             .reschedule()
     };
-    if let Some((old_slot, new_rsp)) = sw {
+    if let Some(sw) = sw {
+        activate(sw.cr3, sw.kstack);
         // SAFETY: both stacks are live task stacks; interrupts are off.
-        unsafe { switch_context(old_slot, new_rsp) };
+        unsafe { switch_context(sw.old_slot, sw.new_rsp) };
         finish_switch();
+    }
+}
+
+/// Load the incoming task's page tables and tell this CPU where its kernel
+/// stack is (for interrupts and SYSCALL entered from ring 3). Interrupts are off.
+fn activate(cr3: u64, kstack: u64) {
+    let target = if cr3 == 0 { paging::kernel_root() } else { cr3 };
+    if Cr3::read().0.start_address().as_u64() != target {
+        let frame = PhysFrame::containing_address(PhysAddr::new(target));
+        // SAFETY: `target` is the root of the kernel space or of a live process
+        // space, both of which map the whole kernel in their upper half.
+        unsafe { Cr3::write(frame, Cr3Flags::empty()) };
+    }
+    if kstack != 0 {
+        percpu::set_kernel_stack(kstack);
     }
 }
 
@@ -676,6 +731,9 @@ fn new_task(name: &'static str, class: Class, pinned: Option<usize>) -> Task {
         }),
         pinned,
         switching: AtomicBool::new(false),
+        process: None,
+        cr3: 0,
+        kstack_top: 0,
     }
 }
 
@@ -737,6 +795,23 @@ pub fn run_ap(cpu: usize, lapic_id: u32) -> ! {
     register_cpu(cpu, lapic_id, rq);
     idle_entry(0);
     unreachable!()
+}
+
+/// The process whose main thread is running on this CPU, if any.
+pub fn current_process() -> Option<Arc<Process>> {
+    interrupts::without_interrupts(|| {
+        with_rq(cpu_index(), |rq| rq.tasks[&rq.current].process.clone())
+    })
+}
+
+/// Interrupt every other online CPU so it re-enters the kernel (used by `kill`).
+pub fn kick_other_cpus() {
+    let me = cpu_index();
+    for (c, s) in CPUS.iter().enumerate() {
+        if c != me && s.online.load(Acquire) {
+            apic::send_ipi(s.lapic_id.load(Relaxed), idt::RESCHED_VECTOR);
+        }
+    }
 }
 
 pub fn online_cpus() -> usize {
@@ -804,8 +879,30 @@ pub fn spawn_on(
         } if runtime_ns == 0 || runtime_ns > period_ns => return Err(SpawnError::InvalidClass),
         _ => {}
     }
+    let task = new_task(name, class, pinned);
+    place_task(task, entry, arg)
+}
+
+/// Start the main thread of a user process (it begins in the kernel and drops
+/// to ring 3 itself, see `process::user_task`).
+pub fn spawn_user(
+    pinned: Option<usize>,
+    name: &'static str,
+    process: Arc<Process>,
+    class: Class,
+    entry: fn(usize),
+    arg: usize,
+) -> Result<TaskId, SpawnError> {
     let mut task = new_task(name, class, pinned);
+    task.cr3 = process.cr3();
+    task.process = Some(process);
+    place_task(task, entry, arg)
+}
+
+fn place_task(mut task: Task, entry: fn(usize), arg: usize) -> Result<TaskId, SpawnError> {
+    let (class, pinned) = (task.class, task.pinned);
     let (stack, rsp) = new_stack(entry, arg);
+    task.kstack_top = (stack.as_ptr() as u64 + STACK_SIZE as u64) & !15;
     task.stack = Some(stack);
     task.rsp = rsp;
     let id = task.id;

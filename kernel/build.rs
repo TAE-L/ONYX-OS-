@@ -33,6 +33,11 @@ fn main() {
     }
     asm.push_str(
         "isr_common:
+    // Entered from ring 3? Then GS still holds the user's base: swap in the kernel's.
+    test byte ptr [rsp + 24], 3
+    jz 1f
+    swapgs
+1:
     push rax
     push rcx
     push rdx
@@ -67,6 +72,10 @@ fn main() {
     pop rcx
     pop rax
     add rsp, 16
+    test byte ptr [rsp + 8], 3
+    jz 2f
+    swapgs
+2:
     iretq
 ",
     );

@@ -205,6 +205,14 @@ static TESTS: &[Test] = &[
         run: pci_enumeration,
     },
     Test {
+        name: "nvme: controller identified, data written is read back, errors are refused",
+        run: nvme_basic,
+    },
+    Test {
+        name: "nvme: every CPU drives its own queue concurrently without mixing data",
+        run: nvme_parallel,
+    },
+    Test {
         name: "PHASE 3b GATE: x87/SSE/AVX state survives preemption and migration, never leaks",
         run: proc_fpu,
     },
@@ -1562,6 +1570,128 @@ fn pci_enumeration() -> TestResult {
         all.windows(2).all(|w| w[0].0 + w[0].1 <= w[1].0),
         "two BARs overlap"
     );
+    Ok(())
+}
+
+fn fill(buf: &mut [u8], seed: u64) {
+    let mut x = seed | 1;
+    for c in buf.chunks_mut(8) {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        let b = x.to_le_bytes();
+        c.copy_from_slice(&b[..c.len()]);
+    }
+}
+
+fn nvme_basic() -> TestResult {
+    let dev = crate::block::get("nvme0n1").ok_or("no nvme0n1 block device")?;
+    let bs = dev.block_size();
+    ensure!(bs == 512 || bs == 4096, "odd block size");
+    ensure!(
+        dev.block_count() * bs as u64 >= 32 << 20,
+        "namespace smaller than the 64 MiB image"
+    );
+    // Sizes from one block to 1 MiB (several commands, PRP lists), at varied LBAs.
+    for (i, blocks) in [1usize, 2, 7, 8, 9, 64, 129, 600, 2048]
+        .into_iter()
+        .enumerate()
+    {
+        let lba = 100 + (i as u64) * 4096;
+        let mut out = alloc::vec![0u8; blocks * bs];
+        fill(&mut out, 0xA5A5 + i as u64);
+        dev.write(lba, &out).map_err(|_| "write failed")?;
+        let mut back = alloc::vec![0xEEu8; blocks * bs];
+        dev.read(lba, &mut back).map_err(|_| "read failed")?;
+        ensure!(out == back, "data read back differs from data written");
+    }
+    // An unaligned (non page-aligned) buffer inside a larger allocation.
+    let mut big = alloc::vec![0u8; 64 * 1024];
+    fill(&mut big[100..100 + 8 * bs], 77);
+    let sent = big[100..100 + 8 * bs].to_vec();
+    dev.write(9000, &big[100..100 + 8 * bs])
+        .map_err(|_| "unaligned write")?;
+    big.fill(0);
+    dev.read(9000, &mut big[100..100 + 8 * bs])
+        .map_err(|_| "unaligned read")?;
+    ensure!(
+        big[100..100 + 8 * bs] == sent[..],
+        "unaligned buffer corrupted"
+    );
+    dev.flush().map_err(|_| "flush failed")?;
+    // Refusals.
+    let mut one = alloc::vec![0u8; bs];
+    ensure!(
+        dev.read(dev.block_count(), &mut one) == Err(crate::block::BlockError::OutOfRange),
+        "read past the end accepted"
+    );
+    ensure!(
+        dev.read(u64::MAX, &mut one) == Err(crate::block::BlockError::OutOfRange),
+        "overflowing LBA accepted"
+    );
+    let mut odd = alloc::vec![0u8; bs + 1];
+    ensure!(
+        dev.read(0, &mut odd) == Err(crate::block::BlockError::BadLength),
+        "partial block accepted"
+    );
+    ensure!(
+        dev.write(0, &[]) == Err(crate::block::BlockError::BadLength),
+        "empty write accepted"
+    );
+    // The last block is reachable.
+    dev.read(dev.block_count() - 1, &mut one)
+        .map_err(|_| "last block unreachable")?;
+    Ok(())
+}
+
+fn nvme_parallel() -> TestResult {
+    let ncpu = sched::online_cpus();
+    let dev = crate::block::get("nvme0n1").ok_or("no nvme0n1 block device")?;
+    let bs = dev.block_size();
+    static FAILED: AtomicU64 = AtomicU64::new(0);
+    static DONE: AtomicU64 = AtomicU64::new(0);
+    FAILED.store(0, core::sync::atomic::Ordering::Relaxed);
+    DONE.store(0, core::sync::atomic::Ordering::Relaxed);
+    fn worker(cpu: usize) {
+        let Some(dev) = crate::block::get("nvme0n1") else {
+            FAILED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            DONE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            return;
+        };
+        let bs = dev.block_size();
+        let region = 20_000 + cpu as u64 * 8192;
+        for round in 0..40u64 {
+            let blocks = 1 + (round as usize * 13) % 200;
+            let mut out = alloc::vec![0u8; blocks * bs];
+            fill(&mut out, (cpu as u64) << 32 | round);
+            let ok = dev.write(region, &out).is_ok() && {
+                let mut back = alloc::vec![0u8; blocks * bs];
+                dev.read(region, &mut back).is_ok() && back == out
+            };
+            if !ok {
+                FAILED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        DONE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+    let _ = bs;
+    for cpu in 0..ncpu {
+        sched::spawn_on(Some(cpu), "nvme-w", sched::Class::fair(), worker, cpu)
+            .map_err(|_| "spawn failed")?;
+    }
+    let start = time::now_ns();
+    while DONE.load(core::sync::atomic::Ordering::Relaxed) < ncpu as u64 {
+        ensure!(
+            time::now_ns() - start < 20_000_000_000,
+            "workers did not finish"
+        );
+        sched::sleep_ns(1_000_000);
+    }
+    ensure!(
+        FAILED.load(core::sync::atomic::Ordering::Relaxed) == 0,
+        "a CPU read back data it had not written"
+    );
+    ensure!(dev.flush().is_ok(), "flush failed");
     Ok(())
 }
 

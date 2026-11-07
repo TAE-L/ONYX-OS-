@@ -16,10 +16,12 @@ extern crate alloc;
 mod log;
 mod acpi;
 mod arch;
+mod block;
 mod boot;
 mod elf;
 mod limine;
 mod mm;
+mod nvme;
 mod panic;
 mod pci;
 mod percpu;
@@ -80,6 +82,7 @@ extern "C" fn kmain() -> ! {
     smp::start_aps();
     pci::init();
     x86_64::instructions::interrupts::enable();
+    nvme::init();
 
     kprintln!(
         "boot complete: {} MiB free of {} MiB",

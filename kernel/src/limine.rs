@@ -182,3 +182,14 @@ pub static MEMMAP: Request<MemmapResponse> = Request::new([0x67cf3d9d378a806f, 0
 #[unsafe(link_section = ".limine_requests")]
 pub static EXECUTABLE_ADDRESS: Request<ExecutableAddressResponse> =
     Request::new([0x71ba76863cc55f63, 0xb2644a48c516a487]);
+
+#[repr(C)]
+pub struct RsdpResponse {
+    _revision: u64,
+    /// Physical address of the RSDP (a direct-map address on older protocol revisions).
+    pub address: u64,
+}
+
+#[used]
+#[unsafe(link_section = ".limine_requests")]
+pub static RSDP: Request<RsdpResponse> = Request::new([0xc5e77b6b397e7b43, 0x27637845accdcf3c]);

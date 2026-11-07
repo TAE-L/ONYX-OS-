@@ -297,6 +297,12 @@ fn qemu_command(esp: &Path, serial: &str, accel: &str, smp: usize) -> Res<Comman
     let (code, vars_template) = find_ovmf()?;
     let vars = root().join("target").join("ovmf_vars.fd");
     fs::copy(&vars_template, &vars).map_err(|e| format!("copy OVMF vars: {e}"))?;
+    let disk = root().join("target").join("nvme.img");
+    if !disk.exists() {
+        let f = fs::File::create(&disk).map_err(|e| format!("create {}: {e}", disk.display()))?;
+        f.set_len(64 << 20)
+            .map_err(|e| format!("size {}: {e}", disk.display()))?;
+    }
     let mut c = Command::new(qemu_binary()?);
     c.args(["-machine", "q35", "-cpu", "max", "-m", "512M"])
         .args(["-smp", &smp.to_string()])
@@ -315,7 +321,10 @@ fn qemu_command(esp: &Path, serial: &str, accel: &str, smp: usize) -> Res<Comman
             vars.display()
         ))
         .arg("-drive")
-        .arg(format!("format=raw,file=fat:rw:{}", esp.display()));
+        .arg(format!("format=raw,file=fat:rw:{}", esp.display()))
+        .arg("-drive")
+        .arg(format!("if=none,id=nvm,format=raw,file={}", disk.display()))
+        .args(["-device", "nvme,serial=onyx0001,drive=nvm"]);
     Ok(c)
 }
 

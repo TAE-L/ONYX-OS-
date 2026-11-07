@@ -201,6 +201,10 @@ static TESTS: &[Test] = &[
         run: proc_isolation,
     },
     Test {
+        name: "pci: ECAM enumeration finds the host bridge and an NVMe controller with a sane BAR",
+        run: pci_enumeration,
+    },
+    Test {
         name: "PHASE 3b GATE: x87/SSE/AVX state survives preemption and migration, never leaks",
         run: proc_fpu,
     },
@@ -1519,6 +1523,44 @@ fn proc_isolation() -> TestResult {
     ensure!(
         (0..cr3s.len()).all(|i| (0..i).all(|j| cr3s[i] != cr3s[j])),
         "two processes share a page-table root"
+    );
+    Ok(())
+}
+
+fn pci_enumeration() -> TestResult {
+    use crate::pci;
+    let devs = pci::devices();
+    ensure!(devs.len() >= 3, "too few PCI devices found");
+    ensure!(
+        devs.iter()
+            .any(|d| d.addr.bus == 0 && d.addr.dev == 0 && d.class == 0x06 && d.subclass == 0x00),
+        "no host bridge at 00:00.0"
+    );
+    // The same identity read through config space again must agree.
+    for d in &devs {
+        let id = pci::read32(d.addr, 0);
+        ensure!(
+            id as u16 == d.vendor && (id >> 16) as u16 == d.device,
+            "config space reads are not stable"
+        );
+    }
+    let nvme = pci::find_class(0x01, 0x08, 0x02).ok_or("no NVMe controller")?;
+    let bar0 = nvme.bars.iter().find(|b| b.index == 0).ok_or("no BAR0")?;
+    ensure!(bar0.is_64 && bar0.size >= 0x4000, "NVMe BAR0 implausible");
+    ensure!(
+        bar0.phys != 0 && bar0.phys % bar0.size == 0,
+        "BAR0 not size-aligned"
+    );
+    // No two memory BARs in the system may overlap.
+    let mut all: alloc::vec::Vec<(u64, u64)> = devs
+        .iter()
+        .flat_map(|d| d.bars.iter().map(|b| (b.phys, b.size)))
+        .filter(|&(p, _)| p != 0)
+        .collect();
+    all.sort();
+    ensure!(
+        all.windows(2).all(|w| w[0].0 + w[0].1 <= w[1].0),
+        "two BARs overlap"
     );
     Ok(())
 }

@@ -14,12 +14,14 @@ extern crate alloc;
 
 #[macro_use]
 mod log;
+mod acpi;
 mod arch;
 mod boot;
 mod elf;
 mod limine;
 mod mm;
 mod panic;
+mod pci;
 mod percpu;
 mod perf;
 mod process;
@@ -76,6 +78,7 @@ extern "C" fn kmain() -> ! {
     syscall::init_cpu();
     sched::init(arch::apic::id());
     smp::start_aps();
+    pci::init();
     x86_64::instructions::interrupts::enable();
 
     kprintln!(

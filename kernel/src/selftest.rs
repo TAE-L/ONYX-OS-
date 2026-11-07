@@ -201,6 +201,10 @@ static TESTS: &[Test] = &[
         run: proc_isolation,
     },
     Test {
+        name: "PHASE 3b GATE: x87/SSE/AVX state survives preemption and migration, never leaks",
+        run: proc_fpu,
+    },
+    Test {
         name: "proc: eight processes at once, all CPUs, correct results",
         run: proc_parallel,
     },
@@ -1255,6 +1259,7 @@ static FAULTS: &[u8] = include_bytes!("../../target/user/faults.elf");
 static SPIN: &[u8] = include_bytes!("../../target/user/spin.elf");
 static ISO: &[u8] = include_bytes!("../../target/user/iso.elf");
 static BADPTR: &[u8] = include_bytes!("../../target/user/badptr.elf");
+static FPU: &[u8] = include_bytes!("../../target/user/fpu.elf");
 static SYSC: &[u8] = include_bytes!("../../target/user/sysc.elf");
 
 fn run_user(
@@ -1516,6 +1521,34 @@ fn proc_isolation() -> TestResult {
         "two processes share a page-table root"
     );
     Ok(())
+}
+
+fn proc_fpu() -> TestResult {
+    let (xsave, xcr0, size) = crate::arch::fpu::describe();
+    kprintln!("       fpu: xsave={xsave} xcr0={xcr0:#x} area={size} bytes");
+    let mut procs = Vec::new();
+    // Eight copies with different data; the first four share CPU 0 so they
+    // constantly displace each other's registers, the rest may migrate.
+    // Even arguments use AVX when the CPU has it, odd ones stay on SSE.
+    for i in 0..8u64 {
+        let pin = if i < 4 { Some(0) } else { None };
+        let arg = (0x40 + i) << 1 | (i & 1);
+        procs.push(process::spawn_elf("fpu", FPU, arg, pin).map_err(|_| "spawn failed")?);
+    }
+    for p in &procs {
+        let status = process::wait(p, 20_000).ok_or("no result")?;
+        ensure!(
+            status != ExitStatus::Exited(2),
+            "a new process started with another one's register state"
+        );
+        if let ExitStatus::Exited(c @ 1..=5) = status {
+            kprintln!("       fpu probe exit code {c} (1 vec, 3 mxcsr, 4 fcw, 5 x87 stack)");
+            return Err("FPU state was corrupted across a task switch");
+        }
+        ensure!(status == ExitStatus::Exited(0), "fpu probe did not finish");
+        ensure!(p.stdout() == b"fpu ok\n", "wrong output");
+    }
+    kernel_is_sane()
 }
 
 fn proc_parallel() -> TestResult {

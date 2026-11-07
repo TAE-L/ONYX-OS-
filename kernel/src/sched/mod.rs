@@ -17,7 +17,7 @@
 //! timer happens inside the interrupt handler, on the interrupted task's own
 //! kernel stack; the task resumes exactly there when picked again.
 
-use crate::arch::{apic, idt, time};
+use crate::arch::{apic, fpu, idt, time};
 use crate::mm::paging;
 use crate::percpu::{self, cpu_index};
 use crate::perf::{Histogram, rdtsc};
@@ -109,6 +109,8 @@ struct Task {
     cr3: u64,
     /// Top of this task's kernel stack, where interrupts from ring 3 land.
     kstack_top: u64,
+    /// Saved x87/SSE/AVX registers while the task is not running.
+    fpu: fpu::FpuState,
 }
 
 /// Everything `schedule` needs to carry out a decision.
@@ -117,6 +119,8 @@ struct Switch {
     new_rsp: u64,
     cr3: u64,
     kstack: u64,
+    old_fpu: *mut u8,
+    new_fpu: *mut u8,
 }
 
 /// Task numbers other CPUs and tests may read without touching a run queue.
@@ -496,14 +500,14 @@ impl Rq {
             return None;
         }
         self.task(old).stats.since_tsc.store(0, Relaxed);
-        let (new_rsp, cr3, kstack) = {
+        let (new_rsp, cr3, kstack, new_fpu) = {
             let n = self.task(next);
             n.state = State::Running;
             n.stats.since_tsc.store(now_tsc, Relaxed);
             if let Some(target) = n.wake_target.take() {
                 WAKE_LATENCY.record(time::tsc_to_ns(rdtsc().saturating_sub(target)));
             }
-            (n.rsp, n.cr3, n.kstack_top)
+            (n.rsp, n.cr3, n.kstack_top, n.fpu.as_ptr())
         };
         self.current = next;
         SWITCHES.fetch_add(1, Relaxed);
@@ -516,12 +520,15 @@ impl Rq {
         let flag: *const AtomicBool = &old_task.switching;
         CPUS[cpu].prev_switch.store(flag.cast_mut(), Release);
         let old_slot: *mut u64 = &mut old_task.rsp;
+        let old_fpu = old_task.fpu.as_ptr();
         self.publish();
         Some(Switch {
             old_slot,
             new_rsp,
             cr3,
             kstack,
+            old_fpu,
+            new_fpu,
         })
     }
 
@@ -676,6 +683,13 @@ fn schedule(pre: impl FnOnce(&mut Rq)) {
     };
     if let Some(sw) = sw {
         activate(sw.cr3, sw.kstack);
+        // SAFETY: both areas are live; the old task's registers are saved before
+        // another CPU may pick it up (`switching` is cleared only after the
+        // switch), and the kernel runs soft-float so nothing clobbers them here.
+        unsafe {
+            fpu::save(sw.old_fpu);
+            fpu::restore(sw.new_fpu);
+        }
         // SAFETY: both stacks are live task stacks; interrupts are off.
         unsafe { switch_context(sw.old_slot, sw.new_rsp) };
         finish_switch();
@@ -734,6 +748,7 @@ fn new_task(name: &'static str, class: Class, pinned: Option<usize>) -> Task {
         process: None,
         cr3: 0,
         kstack_top: 0,
+        fpu: fpu::FpuState::clean(),
     }
 }
 

@@ -60,9 +60,15 @@ pub fn init_quiet(quiet: bool) {
             }
         });
     }
+    super::fpu::init_cpu();
     if quiet {
         return;
     }
+    let (xs, xcr0, area) = super::fpu::describe();
+    kprintln!(
+        "[cpu] fpu: {} xcr0={xcr0:#x} state={area} bytes",
+        if xs { "xsave" } else { "fxsave" }
+    );
     kprintln!(
         "[cpu] nx=on smep={} smap={} umip={} 1gib-pages={} invariant-tsc={}",
         f.smep,

@@ -150,7 +150,7 @@ fn build_user() -> Res<()> {
     let out = root().join("target").join("user");
     fs::create_dir_all(&out).map_err(|e| e.to_string())?;
     let built = root().join("target").join(TARGET).join("release");
-    for name in ["hello", "faults", "spin", "iso", "badptr", "sysc"] {
+    for name in ["hello", "faults", "spin", "iso", "badptr", "sysc", "fpu"] {
         let from = built.join(name);
         fs::copy(&from, out.join(format!("{name}.elf")))
             .map_err(|e| format!("copy {}: {e}", from.display()))?;

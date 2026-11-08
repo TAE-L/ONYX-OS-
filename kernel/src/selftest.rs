@@ -221,6 +221,10 @@ static TESTS: &[Test] = &[
         run: ext4_read,
     },
     Test {
+        name: "ext4: create, write, truncate, mkdir, remove, htree and fragmented files (checked by e2fsck afterwards)",
+        run: ext4_write,
+    },
+    Test {
         name: "fat32: create, write, grow, truncate, mkdir and remove (checked by fsck.fat afterwards)",
         run: fat_write,
     },
@@ -1885,9 +1889,66 @@ fn ext4_read() -> TestResult {
 }
 
 fn fat_write() -> TestResult {
+    fs_write_common("/fat", true)
+}
+
+fn ext4_write() -> TestResult {
+    use crate::vfs::{self, Kind};
+    fs_write_common("/ext4", false)?;
+    // Adding to the indexed (htree) fixture directory converts it to a linear one.
+    let extra = "/ext4/many/added-later.txt";
+    vfs::create(extra, Kind::File).map_err(|_| "create in htree dir")?;
+    vfs::write_at(extra, 0, b"hello htree").map_err(|_| "write in htree dir")?;
+    let list = vfs::read_dir("/ext4/many").map_err(|_| "readdir converted dir")?;
+    ensure!(
+        list.len() == FIXTURE_MANY + 1,
+        "entries lost converting the directory"
+    );
+    for n in 0..FIXTURE_MANY {
+        expect_file(
+            &alloc::format!("/ext4/many/f{n:03}.dat"),
+            10 + n,
+            1000 + n as u64,
+        )?;
+    }
+    // Interleaved appends fragment two files into hundreds of extents each
+    // (a deeper extent tree with several leaf blocks).
+    let (a, b) = ("/ext4/w/frag-a.bin", "/ext4/w/frag-b.bin");
+    vfs::create(a, Kind::File).map_err(|_| "create a")?;
+    vfs::create(b, Kind::File).map_err(|_| "create b")?;
+    for i in 0..700u64 {
+        let blk = alloc::vec![(i % 251) as u8 + 1; 4096];
+        vfs::write_at(a, i * 4096, &blk).map_err(|_| "append a")?;
+        vfs::write_at(b, i * 4096, &blk).map_err(|_| "append b")?;
+    }
+    for p in [a, b] {
+        let data = vfs::read_file(p).map_err(|_| "read fragmented")?;
+        ensure!(data.len() == 700 * 4096, "fragmented size");
+        for i in 0..700usize {
+            ensure!(
+                data[i * 4096..(i + 1) * 4096]
+                    .iter()
+                    .all(|&x| x == (i % 251) as u8 + 1),
+                "fragmented content"
+            );
+        }
+    }
+    // Truncating a heavily fragmented file frees the right blocks.
+    vfs::truncate(a, 10 * 4096 + 5).map_err(|_| "truncate fragmented")?;
+    let data = vfs::read_file(a).map_err(|_| "read after truncate")?;
+    ensure!(data.len() == 10 * 4096 + 5, "size after truncate");
+    ensure!(data[4096..4097] == [2u8], "content after truncate");
+    vfs::remove(a).map_err(|_| "remove a")?;
+    vfs::remove(b).map_err(|_| "remove b")?;
+    vfs::sync_all().map_err(|_| "sync")?;
+    Ok(())
+}
+
+fn fs_write_common(root: &str, ci: bool) -> TestResult {
     use crate::vfs::{self, Kind};
     mount_test_disks()?;
-    let base = "/fat/w";
+    let base_owned = alloc::format!("{root}/w");
+    let base = base_owned.as_str();
     vfs::create(base, Kind::Dir).map_err(|_| "mkdir")?;
     ensure!(
         vfs::create(base, Kind::Dir).is_err(),
@@ -1920,13 +1981,23 @@ fn fat_write() -> TestResult {
         }
         expect.push((p, len, 500 + i as u64));
     }
+    if ci {
+        ensure!(
+            vfs::create(&alloc::format!("{base}/A.TXT"), Kind::File).is_err(),
+            "case-variant duplicate accepted"
+        );
+        ensure!(
+            vfs::create(&alloc::format!("{base}/bad:name"), Kind::File).is_err(),
+            "invalid name accepted"
+        );
+    }
     ensure!(
-        vfs::create(&alloc::format!("{base}/A.TXT"), Kind::File).is_err(),
-        "case-variant duplicate accepted"
+        vfs::create(&alloc::format!("{base}/a.txt"), Kind::File).is_err(),
+        "duplicate accepted"
     );
     ensure!(
-        vfs::create(&alloc::format!("{base}/bad:name"), Kind::File).is_err(),
-        "invalid name accepted"
+        vfs::create(&alloc::format!("{base}/nodir/x"), Kind::File).is_err(),
+        "create in a missing directory"
     );
     for (p, len, seed) in &expect {
         expect_file(p, *len, *seed)?;
@@ -2011,9 +2082,10 @@ fn fat_write() -> TestResult {
         vfs::remove(&p).map_err(|_| "remove big")?;
     }
     // The fixtures were not disturbed by any of this.
-    check_fixture_tree("/fat")?;
-    // A file left behind for fsck.fat to judge.
-    let keep = "/fat/w/kept-after-test.bin";
+    check_fixture_tree(root)?;
+    // A file left behind for the host checker to judge.
+    let keep = alloc::format!("{base}/kept-after-test.bin");
+    let keep = keep.as_str();
     vfs::create(keep, Kind::File).map_err(|_| "create kept")?;
     vfs::write_at(keep, 0, &alloc::vec![0x5A; 100_000]).map_err(|_| "write kept")?;
     vfs::sync_all().map_err(|_| "sync")?;

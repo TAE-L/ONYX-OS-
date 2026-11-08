@@ -27,6 +27,24 @@ pub const FIXTURE_SPARSE: (&str, usize, &[(usize, usize, u64)]) = (
     &[(0, 4096, 20), (4 << 20, 4096, 21), ((8 << 20) - 100, 100, 22)],
 );
 
+/// Ten separate runs: enough extents that ext4 needs an extent tree of depth 1.
+pub const FIXTURE_FRAGMENTED: (&str, usize, &[(usize, usize, u64)]) = (
+    "frag.bin",
+    12 << 20,
+    &[
+        (0, 4096, 30),
+        (1 << 20, 4096, 31),
+        (2 << 20, 4096, 32),
+        (3 << 20, 4096, 33),
+        (4 << 20, 4096, 34),
+        (5 << 20, 4096, 35),
+        (6 << 20, 4096, 36),
+        (7 << 20, 4096, 37),
+        (8 << 20, 4096, 38),
+        ((12 << 20) - 4096, 4096, 39),
+    ],
+);
+
 pub fn fixture_byte(seed: u64, i: usize) -> u8 {
     ((((i as u64).wrapping_mul(2_654_435_761)) ^ seed.wrapping_mul(40_503)) >> 8) as u8
 }

@@ -217,6 +217,10 @@ static TESTS: &[Test] = &[
         run: fat_read,
     },
     Test {
+        name: "ext4: every fixture file, large directory, sparse file and symlink read back exactly",
+        run: ext4_read,
+    },
+    Test {
         name: "fat32: create, write, grow, truncate, mkdir and remove (checked by fsck.fat afterwards)",
         run: fat_write,
     },
@@ -1695,6 +1699,20 @@ fn mount_test_disks() -> TestResult {
         vfs::mount("/fat", fs).is_ok()
     });
     ensure!(*ok, "could not mount the test disks");
+    static EXT: spin::Once<bool> = spin::Once::new();
+    let ok = EXT.call_once(|| {
+        let Some(d) = block::get("serial:onyx0003") else {
+            return false;
+        };
+        match crate::fs::ext4::Ext4::mount(Cache::new(d, 1024)) {
+            Ok(fs) => vfs::mount("/ext4", fs).is_ok(),
+            Err(e) => {
+                kprintln!("       ext4 mount failed: {e:?}");
+                false
+            }
+        }
+    });
+    ensure!(*ok, "could not mount the ext4 disk");
     Ok(())
 }
 
@@ -1737,17 +1755,18 @@ fn check_fixture_tree(root: &str) -> TestResult {
     names.sort();
     names.dedup();
     ensure!(names.len() == FIXTURE_MANY, "duplicate directory entries");
-    // Sparse file: zero except for the written runs.
-    let (name, total, runs) = FIXTURE_SPARSE;
-    let data = vfs::read_file(&alloc::format!("{root}/{name}")).map_err(|_| "sparse read")?;
-    ensure!(data.len() == total, "sparse size");
-    let mut want = alloc::vec![0u8; total];
-    for &(off, len, seed) in runs {
-        for i in 0..len {
-            want[off + i] = fixture_byte(seed, i);
+    // Sparse files: zero except for the written runs.
+    for (name, total, runs) in [FIXTURE_SPARSE, FIXTURE_FRAGMENTED] {
+        let data = vfs::read_file(&alloc::format!("{root}/{name}")).map_err(|_| "sparse read")?;
+        ensure!(data.len() == total, "sparse size");
+        let mut want = alloc::vec![0u8; total];
+        for &(off, len, seed) in runs {
+            for i in 0..len {
+                want[off + i] = fixture_byte(seed, i);
+            }
         }
+        ensure!(data == want, "sparse file content wrong");
     }
-    ensure!(data == want, "sparse file content wrong");
     // Partial reads at awkward offsets and lengths.
     let path = alloc::format!("{root}/big/odd.bin");
     for &(off, len) in &[
@@ -1835,6 +1854,33 @@ fn fat_read() -> TestResult {
     ] {
         ensure!(names.contains(&want), "root listing misses an entry");
     }
+    Ok(())
+}
+
+fn ext4_read() -> TestResult {
+    use crate::vfs;
+    mount_test_disks()?;
+    check_fixture_tree("/ext4")?;
+    ensure!(
+        vfs::read_file("/ext4/link-to-hello").map_err(|_| "follow symlink")?
+            == vfs::read_file("/ext4/HELLO.TXT").map_err(|_| "read target")?,
+        "symlink does not lead to its target"
+    );
+    let link = vfs::resolve_nofollow("/ext4/link-to-hello").map_err(|_| "nofollow")?;
+    ensure!(
+        link.node.kind == vfs::Kind::Symlink,
+        "symlink not reported as one"
+    );
+    ensure!(
+        link.fs.read_link(&link.node).as_deref() == Ok("HELLO.TXT"),
+        "wrong symlink target"
+    );
+    // ext4 names are case-sensitive.
+    ensure!(
+        vfs::stat("/ext4/hello.txt").is_err(),
+        "case-insensitive on ext4"
+    );
+    ensure!(vfs::stat("/ext4/lost+found").is_ok(), "lost+found missing");
     Ok(())
 }
 

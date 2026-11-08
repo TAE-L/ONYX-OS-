@@ -337,14 +337,18 @@ fn make_images() -> Res<()> {
             1000 + n as u64,
         )?;
     }
-    let (name, total, runs) = FIXTURE_SPARSE;
-    let mut sparse = vec![0u8; total];
-    for &(off, len, seed) in runs {
-        for i in 0..len {
-            sparse[off + i] = fixture_byte(seed, i);
+    for (name, total, runs) in [FIXTURE_SPARSE, FIXTURE_FRAGMENTED] {
+        // Written with seeks so the file really has holes (ext4 keeps them).
+        use std::io::{Seek, SeekFrom, Write};
+        let mut f = fs::File::create(stage.join(name)).map_err(|e| e.to_string())?;
+        f.set_len(total as u64).map_err(|e| e.to_string())?;
+        for &(off, len, seed) in runs {
+            let data: Vec<u8> = (0..len).map(|i| fixture_byte(seed, i)).collect();
+            f.seek(SeekFrom::Start(off as u64))
+                .map_err(|e| e.to_string())?;
+            f.write_all(&data).map_err(|e| e.to_string())?;
         }
     }
-    fs::write(stage.join(name), sparse).map_err(|e| e.to_string())?;
 
     let path = |n: &str| dir.join(n).display().to_string();
     // FAT32: 96 MiB, 1 KiB clusters (keeps the cluster count above the FAT32 minimum).

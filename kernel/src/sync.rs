@@ -66,3 +66,32 @@ impl<T> Drop for IrqGuard<'_, T> {
         }
     }
 }
+
+/// A lock for long operations (filesystem calls that wait on a disk). A task
+/// that finds it taken gives its CPU away instead of spinning, so the holder
+/// can run even when both share one CPU. Interrupts stay on while held, so it
+/// must not be taken from interrupt context.
+pub struct YieldMutex<T> {
+    inner: spin::Mutex<T>,
+}
+
+impl<T> YieldMutex<T> {
+    pub const fn new(value: T) -> Self {
+        Self {
+            inner: spin::Mutex::new(value),
+        }
+    }
+
+    pub fn get_mut_unchecked(&mut self) -> &mut T {
+        self.inner.get_mut()
+    }
+
+    pub fn lock(&self) -> spin::MutexGuard<'_, T> {
+        loop {
+            if let Some(g) = self.inner.try_lock() {
+                return g;
+            }
+            crate::sched::yield_now();
+        }
+    }
+}

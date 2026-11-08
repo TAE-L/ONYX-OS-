@@ -181,6 +181,7 @@ pub struct Nvme {
     blocks: u64,
     max_blocks: usize,
     pub model: String,
+    pub serial: String,
 }
 
 fn rd32(regs: u64, off: u64) -> u32 {
@@ -282,6 +283,7 @@ impl Nvme {
         // SAFETY: `id` is a zeroed frame the controller just filled.
         let ident = unsafe { core::slice::from_raw_parts(id, 4096) };
         let model = String::from_utf8_lossy(&ident[24..64]).trim().into();
+        let serial: String = String::from_utf8_lossy(&ident[4..24]).trim().into();
         let mdts = ident[77];
         let max_transfer = if mdts == 0 {
             MAX_TRANSFER
@@ -377,6 +379,7 @@ impl Nvme {
             blocks,
             max_blocks: max_transfer / block_size,
             model,
+            serial,
         }))
     }
 
@@ -494,6 +497,7 @@ pub fn init() -> usize {
                     c.queue_count(),
                     c.model
                 );
+                block::register(&format!("serial:{}", c.serial), c.clone());
                 block::register(&name, c);
                 n += 1;
             }

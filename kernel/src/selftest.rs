@@ -209,6 +209,18 @@ static TESTS: &[Test] = &[
         run: nvme_basic,
     },
     Test {
+        name: "block: the host-built FAT32, ext4 and exFAT disks are attached and recognisable",
+        run: images_present,
+    },
+    Test {
+        name: "fat32: every fixture file reads back exactly; directories, long and non-ASCII names resolve",
+        run: fat_read,
+    },
+    Test {
+        name: "fat32: create, write, grow, truncate, mkdir and remove (checked by fsck.fat afterwards)",
+        run: fat_write,
+    },
+    Test {
         name: "nvme: every CPU drives its own queue concurrently without mixing data",
         run: nvme_parallel,
     },
@@ -1641,6 +1653,324 @@ fn nvme_basic() -> TestResult {
     // The last block is reachable.
     dev.read(dev.block_count() - 1, &mut one)
         .map_err(|_| "last block unreachable")?;
+    Ok(())
+}
+
+fn images_present() -> TestResult {
+    use crate::block;
+    // Boot sector / superblock signatures written by the host mkfs tools.
+    let fat = block::get("serial:onyx0002").ok_or("no FAT32 disk")?;
+    let mut b = alloc::vec![0u8; fat.block_size()];
+    fat.read(0, &mut b).map_err(|_| "read FAT boot sector")?;
+    ensure!(
+        b[510] == 0x55 && b[511] == 0xAA,
+        "FAT boot signature missing"
+    );
+    ensure!(&b[82..90] == b"FAT32   ", "not a FAT32 volume");
+    let ext = block::get("serial:onyx0003").ok_or("no ext4 disk")?;
+    let mut sb = alloc::vec![0u8; 4096];
+    ext.read(0, &mut sb).map_err(|_| "read ext4 superblock")?;
+    let off = 1024 + 56;
+    let magic = u16::from_le_bytes([sb[off], sb[off + 1]]);
+    ensure!(magic == 0xEF53, "ext4 magic missing");
+    let exf = block::get("serial:onyx0004").ok_or("no exFAT disk")?;
+    let mut b = alloc::vec![0u8; exf.block_size()];
+    exf.read(0, &mut b).map_err(|_| "read exFAT boot sector")?;
+    ensure!(&b[3..11] == b"EXFAT   ", "not an exFAT volume");
+    Ok(())
+}
+
+include!("../../common/fixtures.rs");
+
+fn mount_test_disks() -> TestResult {
+    use crate::{block, cache::Cache, fs::fat32::Fat32, vfs};
+    static ONCE: spin::Once<bool> = spin::Once::new();
+    let ok = ONCE.call_once(|| {
+        let Some(d) = block::get("serial:onyx0002") else {
+            return false;
+        };
+        let Ok(fs) = Fat32::mount(Cache::new(d, 1024)) else {
+            return false;
+        };
+        vfs::mount("/fat", fs).is_ok()
+    });
+    ensure!(*ok, "could not mount the test disks");
+    Ok(())
+}
+
+fn expect_file(path: &str, len: usize, seed: u64) -> TestResult {
+    use crate::vfs;
+    let n = vfs::stat(path).map_err(|_| "stat failed")?;
+    ensure!(n.kind == vfs::Kind::File, "not a regular file");
+    ensure!(n.size == len as u64, "wrong size");
+    let data = vfs::read_file(path).map_err(|_| "read failed")?;
+    ensure!(data.len() == len, "short read");
+    for (i, b) in data.iter().enumerate() {
+        ensure!(*b == fixture_byte(seed, i), "content differs");
+    }
+    Ok(())
+}
+
+/// Shared by every filesystem: the fixture tree built by xtask.
+fn check_fixture_tree(root: &str) -> TestResult {
+    use crate::vfs;
+    for (path, len, seed) in FIXTURE_FILES {
+        let full = alloc::format!("{root}/{path}");
+        if expect_file(&full, *len, *seed).is_err() {
+            kprintln!("       fixture mismatch: {full}");
+            return Err("a fixture file did not read back correctly");
+        }
+    }
+    for n in 0..FIXTURE_MANY {
+        let full = alloc::format!("{root}/many/f{n:03}.dat");
+        if expect_file(&full, 10 + n, 1000 + n as u64).is_err() {
+            kprintln!("       fixture mismatch: {full}");
+            return Err("a file in the large directory is wrong");
+        }
+    }
+    let list = vfs::read_dir(&alloc::format!("{root}/many")).map_err(|_| "readdir failed")?;
+    ensure!(
+        list.len() == FIXTURE_MANY,
+        "wrong entry count in the large directory"
+    );
+    let mut names: alloc::vec::Vec<_> = list.iter().map(|e| e.name.clone()).collect();
+    names.sort();
+    names.dedup();
+    ensure!(names.len() == FIXTURE_MANY, "duplicate directory entries");
+    // Sparse file: zero except for the written runs.
+    let (name, total, runs) = FIXTURE_SPARSE;
+    let data = vfs::read_file(&alloc::format!("{root}/{name}")).map_err(|_| "sparse read")?;
+    ensure!(data.len() == total, "sparse size");
+    let mut want = alloc::vec![0u8; total];
+    for &(off, len, seed) in runs {
+        for i in 0..len {
+            want[off + i] = fixture_byte(seed, i);
+        }
+    }
+    ensure!(data == want, "sparse file content wrong");
+    // Partial reads at awkward offsets and lengths.
+    let path = alloc::format!("{root}/big/odd.bin");
+    for &(off, len) in &[
+        (0u64, 1usize),
+        (1, 4095),
+        (4095, 2),
+        (511, 1026),
+        (999_999, 70_000),
+        (2_999_990, 100),
+    ] {
+        let mut buf = alloc::vec![0u8; len];
+        let n = vfs::read_at(&path, off, &mut buf).map_err(|_| "partial read")?;
+        let want_n = len.min(3_000_001usize.saturating_sub(off as usize));
+        ensure!(n == want_n, "partial read length");
+        for (i, b) in buf[..n].iter().enumerate() {
+            ensure!(
+                *b == fixture_byte(10, off as usize + i),
+                "partial read content"
+            );
+        }
+    }
+    let mut b = [0u8; 8];
+    ensure!(
+        vfs::read_at(&path, 3_000_001, &mut b) == Ok(0),
+        "read at EOF"
+    );
+    ensure!(
+        vfs::read_at(&path, 10_000_000, &mut b) == Ok(0),
+        "read past EOF"
+    );
+    // Errors.
+    ensure!(
+        matches!(
+            vfs::stat(&alloc::format!("{root}/nope")),
+            Err(vfs::FsError::NotFound)
+        ),
+        "missing file not reported"
+    );
+    ensure!(
+        matches!(
+            vfs::stat(&alloc::format!("{root}/HELLO.TXT/x")),
+            Err(vfs::FsError::NotDir)
+        ),
+        "file used as directory"
+    );
+    ensure!(
+        matches!(
+            vfs::read_file(&alloc::format!("{root}/many")),
+            Err(vfs::FsError::IsDir)
+        ),
+        "directory read as file"
+    );
+    // Path forms.
+    ensure!(
+        vfs::stat(&alloc::format!("{root}//deep/./a/b/../b/c")).is_ok(),
+        "path normalisation"
+    );
+    Ok(())
+}
+
+fn fat_read() -> TestResult {
+    use crate::vfs;
+    mount_test_disks()?;
+    check_fixture_tree("/fat")?;
+    // FAT names are case-insensitive.
+    ensure!(
+        vfs::stat("/fat/hello.txt").is_ok(),
+        "case-insensitive lookup"
+    );
+    ensure!(
+        vfs::stat("/fat/DIR WITH SPACES/LONG FILE NAME WITH SPACES AND ÜNÏCODE.TXT").is_ok(),
+        "case-insensitive non-ASCII lookup"
+    );
+    let root = vfs::read_dir("/fat").map_err(|_| "readdir root")?;
+    let names: alloc::vec::Vec<_> = root.iter().map(|e| e.name.as_str()).collect();
+    for want in [
+        "HELLO.TXT",
+        "empty",
+        "one",
+        "big",
+        "boundary",
+        "deep",
+        "many",
+        "sparse.bin",
+    ] {
+        ensure!(names.contains(&want), "root listing misses an entry");
+    }
+    Ok(())
+}
+
+fn fat_write() -> TestResult {
+    use crate::vfs::{self, Kind};
+    mount_test_disks()?;
+    let base = "/fat/w";
+    vfs::create(base, Kind::Dir).map_err(|_| "mkdir")?;
+    ensure!(
+        vfs::create(base, Kind::Dir).is_err(),
+        "duplicate mkdir accepted"
+    );
+    // Names that exercise short names, long names, numeric tails and Unicode.
+    let names = [
+        "a.txt",
+        "UPPER.TXT",
+        "mixedCase.Txt",
+        "no_extension",
+        "longer than eight chars.txt",
+        "longfilename1.txt",
+        "longfilename2.txt",
+        "longfilename3.txt",
+        "tab\u{e9}l.txt",
+        "日本語.txt",
+        "a.b.c.d",
+        ".hidden",
+        "x",
+    ];
+    let mut expect: alloc::vec::Vec<(alloc::string::String, usize, u64)> = alloc::vec::Vec::new();
+    for (i, n) in names.iter().enumerate() {
+        let p = alloc::format!("{base}/{n}");
+        vfs::create(&p, Kind::File).map_err(|_| "create")?;
+        let len = [0usize, 1, 511, 1024, 1025, 5000, 70_000][i % 7];
+        let data: alloc::vec::Vec<u8> = (0..len).map(|k| fixture_byte(500 + i as u64, k)).collect();
+        if len > 0 {
+            ensure!(vfs::write_at(&p, 0, &data) == Ok(len), "write");
+        }
+        expect.push((p, len, 500 + i as u64));
+    }
+    ensure!(
+        vfs::create(&alloc::format!("{base}/A.TXT"), Kind::File).is_err(),
+        "case-variant duplicate accepted"
+    );
+    ensure!(
+        vfs::create(&alloc::format!("{base}/bad:name"), Kind::File).is_err(),
+        "invalid name accepted"
+    );
+    for (p, len, seed) in &expect {
+        expect_file(p, *len, *seed)?;
+    }
+    // Overwrite in the middle, append, then a write beyond the end (zero gap).
+    let p = &expect[5].0;
+    let new: alloc::vec::Vec<u8> = (0..3000).map(|k| fixture_byte(9, k)).collect();
+    vfs::write_at(p, 1000, &new).map_err(|_| "overwrite")?;
+    let mut want: alloc::vec::Vec<u8> = (0..5000).map(|k| fixture_byte(expect[5].2, k)).collect();
+    want[1000..4000].copy_from_slice(&new);
+    ensure!(
+        vfs::read_file(p).map_err(|_| "read")? == want,
+        "overwrite content"
+    );
+    vfs::write_at(p, 9000, b"tail").map_err(|_| "sparse write")?;
+    want.resize(9000, 0);
+    want.extend_from_slice(b"tail");
+    ensure!(
+        vfs::read_file(p).map_err(|_| "read")? == want,
+        "gap not zero-filled"
+    );
+    // Truncate down, then up (the regrown tail must be zero, not stale data).
+    vfs::truncate(p, 1500).map_err(|_| "truncate")?;
+    want.truncate(1500);
+    ensure!(
+        vfs::read_file(p).map_err(|_| "read")? == want,
+        "truncate content"
+    );
+    vfs::truncate(p, 6000).map_err(|_| "grow")?;
+    want.resize(6000, 0);
+    ensure!(
+        vfs::read_file(p).map_err(|_| "read")? == want,
+        "regrown tail not zero"
+    );
+    vfs::truncate(p, 0).map_err(|_| "truncate to 0")?;
+    ensure!(
+        vfs::stat(p).map_err(|_| "stat")?.size == 0,
+        "size after truncate to 0"
+    );
+    vfs::write_at(p, 0, b"again").map_err(|_| "rewrite")?;
+    ensure!(
+        vfs::read_file(p).map_err(|_| "read")? == b"again",
+        "rewrite after empty"
+    );
+    // Nested directories and many files (the directory grows past a cluster).
+    vfs::create(&alloc::format!("{base}/d1"), Kind::Dir).map_err(|_| "mkdir d1")?;
+    vfs::create(&alloc::format!("{base}/d1/d2"), Kind::Dir).map_err(|_| "mkdir d2")?;
+    for n in 0..120 {
+        let p = alloc::format!("{base}/d1/d2/file number {n:03} with a long name.dat");
+        vfs::create(&p, Kind::File).map_err(|_| "create many")?;
+        vfs::write_at(&p, 0, &[n as u8; 100]).map_err(|_| "write many")?;
+    }
+    ensure!(
+        vfs::read_dir(&alloc::format!("{base}/d1/d2"))
+            .map_err(|_| "readdir")?
+            .len()
+            == 120,
+        "entry count"
+    );
+    // Remove: files, then the emptied directories; non-empty removal refused.
+    ensure!(
+        vfs::remove(&alloc::format!("{base}/d1")) == Err(vfs::FsError::NotEmpty),
+        "removed a non-empty directory"
+    );
+    for n in 0..120 {
+        vfs::remove(&alloc::format!(
+            "{base}/d1/d2/file number {n:03} with a long name.dat"
+        ))
+        .map_err(|_| "remove file")?;
+    }
+    vfs::remove(&alloc::format!("{base}/d1/d2")).map_err(|_| "rmdir d2")?;
+    vfs::remove(&alloc::format!("{base}/d1")).map_err(|_| "rmdir d1")?;
+    ensure!(
+        vfs::stat(&alloc::format!("{base}/d1")).is_err(),
+        "removed directory still resolves"
+    );
+    // Space is reclaimed: a big file written and removed repeatedly must not leak.
+    for round in 0..4 {
+        let p = alloc::format!("{base}/big{round}.bin");
+        vfs::create(&p, Kind::File).map_err(|_| "create big")?;
+        vfs::write_at(&p, 0, &alloc::vec![round as u8 + 1; 8 << 20]).map_err(|_| "write big")?;
+        vfs::remove(&p).map_err(|_| "remove big")?;
+    }
+    // The fixtures were not disturbed by any of this.
+    check_fixture_tree("/fat")?;
+    // A file left behind for fsck.fat to judge.
+    let keep = "/fat/w/kept-after-test.bin";
+    vfs::create(keep, Kind::File).map_err(|_| "create kept")?;
+    vfs::write_at(keep, 0, &alloc::vec![0x5A; 100_000]).map_err(|_| "write kept")?;
+    vfs::sync_all().map_err(|_| "sync")?;
     Ok(())
 }
 

@@ -18,7 +18,9 @@ mod acpi;
 mod arch;
 mod block;
 mod boot;
+mod cache;
 mod elf;
+mod fs;
 mod limine;
 mod mm;
 mod nvme;
@@ -36,12 +38,13 @@ mod serial;
 mod smp;
 mod sync;
 mod syscall;
+mod vfs;
 
 pub const NAME: &str = "OnyxOS";
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Initial kernel heap. Backed by contiguous physical frames via the direct map.
-const HEAP_BYTES: usize = 16 * 1024 * 1024;
+const HEAP_BYTES: usize = 64 * 1024 * 1024;
 
 // Entry point. Limine enters with interrupts off on its own stack; switch to
 // our guarded boot stack before running any Rust code.

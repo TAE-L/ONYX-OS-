@@ -293,7 +293,140 @@ impl VmLock {
     }
 }
 
+include!("../../common/fixtures.rs");
+
+fn write_pattern(path: &Path, len: usize, seed: u64) -> Res<()> {
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
+    }
+    let data: Vec<u8> = (0..len).map(|i| fixture_byte(seed, i)).collect();
+    fs::write(path, data).map_err(|e| format!("write {}: {e}", path.display()))
+}
+
+fn tool(name: &str, args: &[&str]) -> Res<()> {
+    let mut c = Command::new(name);
+    c.args(args).env("LANG", "C.UTF-8").env("LC_ALL", "C.UTF-8");
+    let out = c
+        .output()
+        .map_err(|e| format!("cannot run {name} (is it installed?): {e}"))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{name} {args:?} failed: {}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        ))
+    }
+}
+
+/// Fresh FAT32, ext4 and exFAT test disks in `target/images/`, built with the
+/// standard host tools (the same ones the filesystems are later checked with).
+fn make_images() -> Res<()> {
+    let dir = root().join("target").join("images");
+    let stage = dir.join("stage");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&stage).map_err(|e| e.to_string())?;
+    for (path, len, seed) in FIXTURE_FILES {
+        write_pattern(&stage.join(path), *len, *seed)?;
+    }
+    for n in 0..FIXTURE_MANY {
+        write_pattern(
+            &stage.join(format!("many/f{n:03}.dat")),
+            10 + n,
+            1000 + n as u64,
+        )?;
+    }
+    let (name, total, runs) = FIXTURE_SPARSE;
+    let mut sparse = vec![0u8; total];
+    for &(off, len, seed) in runs {
+        for i in 0..len {
+            sparse[off + i] = fixture_byte(seed, i);
+        }
+    }
+    fs::write(stage.join(name), sparse).map_err(|e| e.to_string())?;
+
+    let path = |n: &str| dir.join(n).display().to_string();
+    // FAT32: 96 MiB, 1 KiB clusters (keeps the cluster count above the FAT32 minimum).
+    let fat = path("fat32.img");
+    fs::File::create(&fat)
+        .and_then(|f| f.set_len(96 << 20))
+        .map_err(|e| e.to_string())?;
+    tool("mkfs.fat", &["-F", "32", "-s", "2", "-n", "ONYXFAT", &fat])?;
+    let entries: Vec<String> = fs::read_dir(&stage)
+        .map_err(|e| e.to_string())?
+        .map(|e| e.unwrap().path().display().to_string())
+        .collect();
+    let mut args = vec!["-i", fat.as_str(), "-s", "-Q"];
+    args.extend(entries.iter().map(String::as_str));
+    args.push("::/");
+    tool("mcopy", &args)?;
+    // ext4 with the default feature set (extents, htree, metadata_csum, 64bit).
+    let ext = path("ext4.img");
+    fs::File::create(&ext)
+        .and_then(|f| f.set_len(64 << 20))
+        .map_err(|e| e.to_string())?;
+    // A symlink only ext4 gets.
+    #[cfg(unix)]
+    {
+        let _ = std::os::unix::fs::symlink("HELLO.TXT", stage.join("link-to-hello"));
+    }
+    tool(
+        "mkfs.ext4",
+        &[
+            "-q",
+            "-F",
+            "-L",
+            "onyxext4",
+            "-d",
+            &stage.display().to_string(),
+            &ext,
+        ],
+    )?;
+    // exFAT: formatted empty (no host tool can fill it without a mount).
+    let exf = path("exfat.img");
+    fs::File::create(&exf)
+        .and_then(|f| f.set_len(64 << 20))
+        .map_err(|e| e.to_string())?;
+    tool("mkfs.exfat", &["-L", "ONYXEXF", &exf])?;
+    fs::remove_dir_all(&stage).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// The independent judges: the host's own checkers run over every disk the
+/// kernel just modified. Any complaint fails the test run.
+fn check_images() -> Res<()> {
+    let dir = root().join("target").join("images");
+    let p = |n: &str| dir.join(n).display().to_string();
+    for (name, tool, args) in [
+        ("FAT32", "fsck.fat", vec!["-n", "-v"]),
+        ("ext4", "e2fsck", vec!["-f", "-n"]),
+        ("exFAT", "fsck.exfat", vec!["-n"]),
+    ] {
+        let file = match name {
+            "FAT32" => p("fat32.img"),
+            "ext4" => p("ext4.img"),
+            _ => p("exfat.img"),
+        };
+        let out = Command::new(tool)
+            .args(&args)
+            .arg(&file)
+            .output()
+            .map_err(|e| format!("cannot run {tool}: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "{tool} reports problems on the {name} disk the kernel wrote:\n{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            ));
+        }
+        eprintln!("{tool}: {name} disk is clean");
+    }
+    Ok(())
+}
+
 fn qemu_command(esp: &Path, serial: &str, accel: &str, smp: usize) -> Res<Command> {
+    make_images()?;
     let (code, vars_template) = find_ovmf()?;
     let vars = root().join("target").join("ovmf_vars.fd");
     fs::copy(&vars_template, &vars).map_err(|e| format!("copy OVMF vars: {e}"))?;
@@ -325,6 +458,21 @@ fn qemu_command(esp: &Path, serial: &str, accel: &str, smp: usize) -> Res<Comman
         .arg("-drive")
         .arg(format!("if=none,id=nvm,format=raw,file={}", disk.display()))
         .args(["-device", "nvme,serial=onyx0001,drive=nvm"]);
+    for (i, img) in ["fat32", "ext4", "exfat"].iter().enumerate() {
+        let file = root()
+            .join("target")
+            .join("images")
+            .join(format!("{img}.img"));
+        c.arg("-drive")
+            .arg(format!(
+                "if=none,id=d{i},format=raw,file={}",
+                file.display()
+            ))
+            .args([
+                "-device",
+                &format!("nvme,serial=onyx{:04},drive=d{i}", i + 2),
+            ]);
+    }
     Ok(c)
 }
 
@@ -379,6 +527,7 @@ fn test(o: &Opts) -> Res<()> {
     match (code, result_line, kernel_panicked) {
         (EXIT_PASS, Some(line), false) if line.contains(" 0 failed") => {
             print_log(&serial, 40);
+            check_images()?;
             eprintln!(
                 "\nOK ({accel}, {:.1}s): {line}",
                 start.elapsed().as_secs_f32()
